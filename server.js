@@ -87,7 +87,6 @@ app.post("/api/monday-tickets", async (req, res) => {
                 column_values {
                   id
                   text
-                  value
                   type
                 }
               }
