@@ -64,11 +64,11 @@ app.post("/api/twilio-token", (req, res) => {
 });
 
 /* ================================
-   MONDAY TICKETS
+   MONDAY TICKETS (ANCIEN - POST)
    ================================ */
 app.post("/api/monday-tickets", async (req, res) => {
   try {
-    console.log("[Monday] Fetching tickets...");
+    console.log("[Monday] Fetching tickets (POST)...");
 
     const query = `
       query ($boardId: ID!) {
@@ -125,6 +125,71 @@ app.post("/api/monday-tickets", async (req, res) => {
 });
 
 /* ================================
+   MONDAY TICKETS (NOUVEAU - GET SÉCURISÉ)
+   ✅ Route proxy sécurisée - Token caché sur serveur
+   ================================ */
+app.get("/api/monday/tickets", async (req, res) => {
+  console.log("[API] 📅 Fetching tickets from Monday (Proxy)...");
+
+  if (!process.env.MONDAY_TOKEN) {
+    console.error("❌ MONDAY_TOKEN manquant !");
+    return res.status(500).json({ error: "Server misconfigured (missing MONDAY_TOKEN)" });
+  }
+
+  const boardId = process.env.MONDAY_BOARD_ID || 8770068548;
+  
+  const query = `
+    query ($boardId: ID!) {
+      boards(ids: [$boardId]) {
+        id
+        name
+        groups {
+          id
+          title
+          items_page(limit: 50) {
+            items {
+              id
+              name
+              created_at
+              column_values {
+                id
+                text
+                type
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  try {
+    const response = await axios.post(
+      "https://api.monday.com/v2",
+      { query, variables: { boardId } },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.MONDAY_TOKEN}`, // ✅ Token sécurisé
+        },
+      }
+    );
+
+    if (response.data.errors) {
+      console.error("[API] ❌ Monday errors:", response.data.errors);
+      return res.status(400).json({ errors: response.data.errors });
+    }
+
+    console.log("[API] ✅ Tickets fetched successfully");
+    res.json(response.data); // Retourne le JSON brut
+
+  } catch (error) {
+    console.error("[API] ❌ Fetch error:", error.message);
+    res.status(500).json({ error: "Failed to fetch Monday tickets" });
+  }
+});
+
+/* ================================
    OUTLOOK TOKEN (OAuth)
    ================================ */
 app.post("/api/outlook-auth", (req, res) => {
@@ -175,7 +240,7 @@ app.use((err, req, res, next) => {
 /* ================================
    START SERVER
    ================================ */
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`✅ Backend running on port ${PORT}`);
   console.log(`📍 URL: http://localhost:${PORT}`);
