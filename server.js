@@ -14,6 +14,7 @@ console.log("ENV vars loaded:", {
   TWILIO_API_KEY: process.env.TWILIO_API_KEY ? "✓" : "✗",
   TWILIO_API_SECRET: process.env.TWILIO_API_SECRET ? "✓" : "✗",
   TWILIO_TWIML_APP_SID: process.env.TWILIO_TWIML_APP_SID ? "✓" : "✗",
+  TWILIO_PHONE_NUMBER: process.env.TWILIO_PHONE_NUMBER ? "✓" : "✗",
   MONDAY_TOKEN: process.env.MONDAY_TOKEN ? "✓" : "✗",
 });
 
@@ -32,7 +33,7 @@ app.get("/", (req, res) => {
    ================================ */
 app.post("/api/twilio-token", (req, res) => {
   try {
-    console.log("[Twilio] Generating token...");
+    console.log("[Twilio] 🔐 Generating token...");
 
     const AccessToken = twilio.jwt.AccessToken;
     const VoiceGrant = AccessToken.VoiceGrant;
@@ -50,7 +51,7 @@ app.post("/api/twilio-token", (req, res) => {
     );
 
     const jwtToken = token.toJwt();
-    console.log("[Twilio] ✅ Token generated");
+    console.log("[Twilio] ✅ Token generated successfully");
 
     res.json({
       token: jwtToken,
@@ -58,17 +59,61 @@ app.post("/api/twilio-token", (req, res) => {
       phoneNumber: process.env.TWILIO_PHONE_NUMBER,
     });
   } catch (e) {
-    console.error("[Twilio] ❌ Error:", e.message);
+    console.error("[Twilio] ❌ Token Error:", e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
 /* ================================
-   MONDAY TICKETS (ANCIEN - POST)
+   TWIML VOICE (Logique d'appel)
+   ✅ Gère les appels sortants depuis le navigateur
+   ================================ */
+app.post("/api/voice", (req, res) => {
+  try {
+    console.log("[Voice] 📞 Incoming TwiML request...");
+    
+    const VoiceResponse = twilio.twiml.VoiceResponse;
+    const response = new VoiceResponse();
+    const { To } = req.body;
+
+    console.log(`[Voice] Dialing to: ${To}`);
+
+    if (To) {
+      // Crée un <Dial> vers le numéro de destination
+      const dial = response.dial({
+        callerId: process.env.TWILIO_PHONE_NUMBER, // Notre numéro Twilio
+        timeout: 30,
+      });
+
+      // Vérifie si c'est un vrai numéro ou un client
+      if (/^[\d\+\-\(\) ]+$/.test(To)) {
+        // C'est un numéro: on appelle directement
+        dial.number(To);
+        console.log(`[Voice] ✅ Dialing phone number: ${To}`);
+      } else {
+        // C'est un client (identificateur texte)
+        dial.client(To);
+        console.log(`[Voice] ✅ Dialing client: ${To}`);
+      }
+    } else {
+      response.say("Merci d'appeler AFI OPS. Aucun destinataire spécifié.");
+      console.log("[Voice] ⚠️  No destination provided");
+    }
+
+    res.type("text/xml");
+    res.send(response.toString());
+  } catch (e) {
+    console.error("[Voice] ❌ TwiML Error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ================================
+   MONDAY TICKETS (POST - ANCIEN)
    ================================ */
 app.post("/api/monday-tickets", async (req, res) => {
   try {
-    console.log("[Monday] Fetching tickets (POST)...");
+    console.log("[Monday] 📅 Fetching tickets (POST)...");
 
     const query = `
       query ($boardId: ID!) {
@@ -125,7 +170,7 @@ app.post("/api/monday-tickets", async (req, res) => {
 });
 
 /* ================================
-   MONDAY TICKETS (NOUVEAU - GET SÉCURISÉ)
+   MONDAY TICKETS (GET - SÉCURISÉ)
    ✅ Route proxy sécurisée - Token caché sur serveur
    ================================ */
 app.get("/api/monday/tickets", async (req, res) => {
@@ -170,7 +215,7 @@ app.get("/api/monday/tickets", async (req, res) => {
       {
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${process.env.MONDAY_TOKEN}`, // ✅ Token sécurisé
+          Authorization: `Bearer ${process.env.MONDAY_TOKEN}`,
         },
       }
     );
@@ -181,7 +226,7 @@ app.get("/api/monday/tickets", async (req, res) => {
     }
 
     console.log("[API] ✅ Tickets fetched successfully");
-    res.json(response.data); // Retourne le JSON brut
+    res.json(response.data);
 
   } catch (error) {
     console.error("[API] ❌ Fetch error:", error.message);
@@ -194,7 +239,7 @@ app.get("/api/monday/tickets", async (req, res) => {
    ================================ */
 app.post("/api/outlook-auth", (req, res) => {
   try {
-    console.log("[Outlook] Generating OAuth URL...");
+    console.log("[Outlook] 🔐 Generating OAuth URL...");
 
     const clientId = process.env.OUTLOOK_CLIENT_ID;
     const tenantId = process.env.OUTLOOK_TENANT_ID;
@@ -216,7 +261,7 @@ app.post("/api/outlook-auth", (req, res) => {
    ================================ */
 app.get("/api/tidio-config", (req, res) => {
   try {
-    console.log("[Tidio] Fetching config...");
+    console.log("[Tidio] 🔧 Fetching config...");
 
     const projectId = process.env.TIDIO_PROJECT_ID;
 
@@ -244,4 +289,5 @@ const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`✅ Backend running on port ${PORT}`);
   console.log(`📍 URL: http://localhost:${PORT}`);
+  console.log(`📞 TwiML Voice URL: ${process.env.RENDER_EXTERNAL_URL || 'http://localhost:' + PORT}/api/voice`);
 });
