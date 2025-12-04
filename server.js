@@ -20,7 +20,7 @@ console.log("ENV vars loaded:", {
 
 /* ================================
    HEALTH CHECK
-   ================================ */
+================================ */
 app.get("/", (req, res) => {
   res.json({
     status: "AFI OPS Backend OK",
@@ -30,7 +30,7 @@ app.get("/", (req, res) => {
 
 /* ================================
    TWILIO TOKEN (VoIP)
-   ================================ */
+================================ */
 app.post("/api/twilio-token", (req, res) => {
   try {
     console.log("[Twilio] 🔐 Generating token...");
@@ -67,11 +67,11 @@ app.post("/api/twilio-token", (req, res) => {
 /* ================================
    TWIML VOICE (Logique d'appel)
    ✅ Gère les appels sortants depuis le navigateur
-   ================================ */
+================================ */
 app.post("/api/voice", (req, res) => {
   try {
     console.log("[Voice] 📞 Incoming TwiML request...");
-    
+
     const VoiceResponse = twilio.twiml.VoiceResponse;
     const response = new VoiceResponse();
     const { To } = req.body;
@@ -79,19 +79,15 @@ app.post("/api/voice", (req, res) => {
     console.log(`[Voice] Dialing to: ${To}`);
 
     if (To) {
-      // Crée un <Dial> vers le numéro de destination
       const dial = response.dial({
-        callerId: process.env.TWILIO_PHONE_NUMBER, // Notre numéro Twilio
+        callerId: process.env.TWILIO_PHONE_NUMBER,
         timeout: 30,
       });
 
-      // Vérifie si c'est un vrai numéro ou un client
       if (/^[\d\+\-\(\) ]+$/.test(To)) {
-        // C'est un numéro: on appelle directement
         dial.number(To);
         console.log(`[Voice] ✅ Dialing phone number: ${To}`);
       } else {
-        // C'est un client (identificateur texte)
         dial.client(To);
         console.log(`[Voice] ✅ Dialing client: ${To}`);
       }
@@ -110,7 +106,7 @@ app.post("/api/voice", (req, res) => {
 
 /* ================================
    MONDAY TICKETS (POST - ANCIEN)
-   ================================ */
+================================ */
 app.post("/api/monday-tickets", async (req, res) => {
   try {
     console.log("[Monday] 📅 Fetching tickets (POST)...");
@@ -133,6 +129,7 @@ app.post("/api/monday-tickets", async (req, res) => {
                   id
                   text
                   type
+                  value
                 }
               }
             }
@@ -141,7 +138,8 @@ app.post("/api/monday-tickets", async (req, res) => {
       }
     `;
 
-    const response = await axios.post("https://api.monday.com/v2", 
+    const response = await axios.post(
+      "https://api.monday.com/v2",
       {
         query,
         variables: { boardId: process.env.MONDAY_BOARD_ID },
@@ -160,7 +158,7 @@ app.post("/api/monday-tickets", async (req, res) => {
     }
 
     const board = response.data.data.boards[0];
-    console.log(`[Monday] ✅ ${board.groups.length} groups fetched`);
+    console.log(`[Monday] ✅ ${board.groups.length} groups fetched (POST)`);
 
     res.json({ board });
   } catch (e) {
@@ -170,19 +168,21 @@ app.post("/api/monday-tickets", async (req, res) => {
 });
 
 /* ================================
-   MONDAY TICKETS (GET - SÉCURISÉ)
-   ✅ Route proxy sécurisée - Token caché sur serveur
-   ================================ */
+   MONDAY TICKETS (GET - PROXY NORMALISÉ)
+   ✅ Retourne { items: [...] } pour le front
+================================ */
 app.get("/api/monday/tickets", async (req, res) => {
   console.log("[API] 📅 Fetching tickets from Monday (Proxy)...");
 
   if (!process.env.MONDAY_TOKEN) {
     console.error("❌ MONDAY_TOKEN manquant !");
-    return res.status(500).json({ error: "Server misconfigured (missing MONDAY_TOKEN)" });
+    return res
+      .status(500)
+      .json({ error: "Server misconfigured (missing MONDAY_TOKEN)" });
   }
 
   const boardId = process.env.MONDAY_BOARD_ID || 8770068548;
-  
+
   const query = `
     query ($boardId: ID!) {
       boards(ids: [$boardId]) {
@@ -196,10 +196,12 @@ app.get("/api/monday/tickets", async (req, res) => {
               id
               name
               created_at
+              updated_at
               column_values {
                 id
                 text
                 type
+                value
               }
             }
           }
@@ -225,9 +227,43 @@ app.get("/api/monday/tickets", async (req, res) => {
       return res.status(400).json({ errors: response.data.errors });
     }
 
-    console.log("[API] ✅ Tickets fetched successfully");
-    res.json(response.data);
+    const apiData = response.data;
+    const boards = apiData?.data?.boards || [];
+    const board = boards[0];
 
+    if (!board) {
+      console.warn("[API] ⚠️ No board returned from Monday");
+      return res.json({ items: [] });
+    }
+
+    const items = [];
+
+    board.groups.forEach((group) => {
+      const groupItems = group.items_page?.items || [];
+      groupItems.forEach((item) => {
+        const cols = item.column_values || [];
+        const colMap = {};
+        cols.forEach((col) => {
+          colMap[col.id] = {
+            id: col.id,
+            text: col.text,
+            type: col.type,
+            value: col.value,
+          };
+        });
+
+        items.push({
+          id: item.id,
+          name: item.name,
+          created_at: item.created_at,
+          updated_at: item.updated_at,
+          column_values: colMap,
+        });
+      });
+    });
+
+    console.log(`[API] ✅ Tickets normalized: ${items.length} items`);
+    res.json({ items });
   } catch (error) {
     console.error("[API] ❌ Fetch error:", error.message);
     res.status(500).json({ error: "Failed to fetch Monday tickets" });
@@ -236,16 +272,19 @@ app.get("/api/monday/tickets", async (req, res) => {
 
 /* ================================
    OUTLOOK TOKEN (OAuth)
-   ================================ */
+================================ */
 app.post("/api/outlook-auth", (req, res) => {
   try {
     console.log("[Outlook] 🔐 Generating OAuth URL...");
 
     const clientId = process.env.OUTLOOK_CLIENT_ID;
     const tenantId = process.env.OUTLOOK_TENANT_ID;
-    const redirectUri = process.env.OUTLOOK_REDIRECT_URI || "https://codepen.io";
+    const redirectUri =
+      process.env.OUTLOOK_REDIRECT_URI || "https://codepen.io";
 
-    const authUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=Mail.Read Mail.Send offline_access`;
+    const authUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(
+      redirectUri
+    )}&response_type=code&scope=Mail.Read Mail.Send offline_access`;
 
     console.log("[Outlook] ✅ OAuth URL generated");
 
@@ -258,7 +297,7 @@ app.post("/api/outlook-auth", (req, res) => {
 
 /* ================================
    TIDIO CONFIG
-   ================================ */
+================================ */
 app.get("/api/tidio-config", (req, res) => {
   try {
     console.log("[Tidio] 🔧 Fetching config...");
@@ -276,7 +315,7 @@ app.get("/api/tidio-config", (req, res) => {
 
 /* ================================
    ERROR HANDLING
-   ================================ */
+================================ */
 app.use((err, req, res, next) => {
   console.error("[Error]", err);
   res.status(500).json({ error: "Internal server error" });
@@ -284,10 +323,14 @@ app.use((err, req, res, next) => {
 
 /* ================================
    START SERVER
-   ================================ */
+================================ */
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`✅ Backend running on port ${PORT}`);
   console.log(`📍 URL: http://localhost:${PORT}`);
-  console.log(`📞 TwiML Voice URL: ${process.env.RENDER_EXTERNAL_URL || 'http://localhost:' + PORT}/api/voice`);
+  console.log(
+    `📞 TwiML Voice URL: ${
+      process.env.RENDER_EXTERNAL_URL || "http://localhost:" + PORT
+    }/api/voice`
+  );
 });
