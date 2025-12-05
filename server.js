@@ -3,7 +3,7 @@
 * AFI OPS Backend (Render / Local)
 * * Twilio Voice Token (JWT moderne)
 * * TwiML Voice endpoint
-* * Monday tickets proxy normalisé (avec cache)
+* * Monday tickets proxy normalisé + cache TTL
     */
 
 const express = require("express");
@@ -13,17 +13,7 @@ const cors = require("cors");
 require("dotenv").config();
 
 const app = express();
-
-/* ================================
-MIDDLEWARES
-================================ */
-app.use(
-cors({
-origin: "*", // ok en phase dev. Si tu veux whitelister CodePen/AFI plus tard, on ajuste.
-methods: ["GET", "POST", "OPTIONS"],
-allowedHeaders: ["Content-Type", "Authorization"],
-})
-);
+app.use(cors());
 app.use(express.json());
 
 console.log("🚀 AFI OPS Backend starting...");
@@ -37,6 +27,30 @@ MONDAY_TOKEN: process.env.MONDAY_TOKEN ? "✓" : "✗",
 MONDAY_BOARD_ID: process.env.MONDAY_BOARD_ID ? "✓" : "⚠️ fallback",
 RENDER_EXTERNAL_URL: process.env.RENDER_EXTERNAL_URL ? "✓" : "⚠️ local",
 });
+
+/* ================================
+SIMPLE CACHE (in-memory)
+
+* 1 clé: "monday_tickets"
+* TTL par défaut 15s (front refresh 15s)
+  ================================ */
+  const cache = new Map();
+  const CACHE_TTL_MS = Number(process.env.MONDAY_CACHE_TTL_MS || 15000);
+
+function cacheGet(key) {
+const entry = cache.get(key);
+if (!entry) return null;
+const isExpired = Date.now() - entry.ts > entry.ttl;
+if (isExpired) {
+cache.delete(key);
+return null;
+}
+return entry.value;
+}
+
+function cacheSet(key, value, ttl = CACHE_TTL_MS) {
+cache.set(key, { value, ts: Date.now(), ttl });
+}
 
 /* ================================
 HEALTH CHECK
@@ -66,12 +80,7 @@ const {
   TWILIO_PHONE_NUMBER,
 } = process.env;
 
-if (
-  !TWILIO_ACCOUNT_SID ||
-  !TWILIO_API_KEY ||
-  !TWILIO_API_SECRET ||
-  !TWILIO_TWIML_APP_SID
-) {
+if (!TWILIO_ACCOUNT_SID || !TWILIO_API_KEY || !TWILIO_API_SECRET || !TWILIO_TWIML_APP_SID) {
   return res.status(500).json({
     error: "Missing Twilio env vars. Check TWILIO_* in Render.",
   });
@@ -84,8 +93,8 @@ const identity = req.body?.identity || "afi-agent";
 
 const token = new AccessToken(
   TWILIO_ACCOUNT_SID,
-  TWILIO_API_KEY, // doit être SK...
-  TWILIO_API_SECRET, // secret de la SK
+  TWILIO_API_KEY,     // SK...
+  TWILIO_API_SECRET,  // secret SK
   { identity }
 );
 
@@ -100,8 +109,7 @@ const jwtToken = token.toJwt();
 console.log("[Twilio] ✅ Token generated for identity:", identity);
 
 const baseUrl =
-  process.env.RENDER_EXTERNAL_URL ||
-  `http://localhost:${process.env.PORT || 10000}`;
+  process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 10000}`;
 
 res.json({
   token: jwtToken,
@@ -121,7 +129,6 @@ res.status(500).json({ error: e.message });
 /* ================================
 TWIML VOICE (Logique d'appel)
 POST /api/voice
-✅ Gère les appels sortants depuis le navigateur
 ================================ */
 app.post("/api/voice", (req, res) => {
 try {
@@ -163,22 +170,12 @@ res.status(500).json({ error: e.message });
 });
 
 /* ================================
-MONDAY CACHE / DEDUPE
-================================ */
-const mondayCache = {
-value: null,
-ts: 0,
-ttlMs: 12_000, // 12 sec = assez pour éviter le spam sans rendre la console "lente"
-inFlight: null, // promise en cours
-};
-
-/* ================================
-MONDAY TICKETS (GET - PROXY NORMALISÉ)
+MONDAY TICKETS (GET - PROXY NORMALISÉ + CACHE)
 GET /api/monday/tickets
-✅ Retourne { items: [...] } pour le front
+Retourne { items: [...] }
 ================================ */
 app.get("/api/monday/tickets", async (req, res) => {
-const now = Date.now();
+console.log("[API] 📅 Fetching tickets from Monday (Proxy)...");
 
 if (!process.env.MONDAY_TOKEN) {
 console.error("❌ MONDAY_TOKEN manquant !");
@@ -187,20 +184,11 @@ return res
 .json({ error: "Server misconfigured (missing MONDAY_TOKEN)" });
 }
 
-// Serve cache si frais
-if (mondayCache.value && now - mondayCache.ts < mondayCache.ttlMs) {
-return res.json(mondayCache.value);
-}
-
-// Si une requête est déjà en cours, on attend la même
-if (mondayCache.inFlight) {
-try {
-const cached = await mondayCache.inFlight;
+// 1) Cache hit?
+const cached = cacheGet("monday_tickets");
+if (cached) {
+console.log(`[API] ⚡ Cache hit (${cached.items?.length || 0} items)`);
 return res.json(cached);
-} catch (e) {
-// si la requête in-flight a planté, on continue vers un nouveau fetch
-mondayCache.inFlight = null;
-}
 }
 
 const boardId = process.env.MONDAY_BOARD_ID || 8770068548;
@@ -231,9 +219,7 @@ const query = `     query ($boardId: ID!) {
     }
   `;
 
-console.log("[Monday] 📅 Fetching tickets (proxy)...");
-
-mondayCache.inFlight = (async () => {
+try {
 const response = await axios.post(
 "[https://api.monday.com/v2](https://api.monday.com/v2)",
 { query, variables: { boardId } },
@@ -249,31 +235,29 @@ timeout: 15000,
 
 ```
 if (response.data.errors) {
-  const err = response.data.errors;
-  console.error("[Monday] ❌ Errors:", err);
-  const e = new Error("Monday API errors");
-  e.details = err;
-  throw e;
+  console.error("[API] ❌ Monday errors:", response.data.errors);
+  return res.status(400).json({ errors: response.data.errors });
 }
 
 const boards = response.data?.data?.boards || [];
 const board = boards[0];
 
 if (!board) {
-  console.warn("[Monday] ⚠️ No board returned");
-  return { items: [] };
+  console.warn("[API] ⚠️ No board returned from Monday");
+  const emptyPayload = { items: [] };
+  cacheSet("monday_tickets", emptyPayload);
+  return res.json(emptyPayload);
 }
 
-const groups = Array.isArray(board.groups) ? board.groups : [];
+console.log("[API] Board:", board.id, board.name);
+
 const items = [];
 
-for (const group of groups) {
+(board.groups || []).forEach((group) => {
   const groupItems = group.items_page?.items || [];
-
-  for (const item of groupItems) {
+  groupItems.forEach((item) => {
     const cols = item.column_values || [];
     const colMap = {};
-
     cols.forEach((col) => {
       colMap[col.id] = {
         id: col.id,
@@ -291,36 +275,21 @@ for (const group of groups) {
       column_values: colMap,
       _group: { id: group.id, title: group.title },
     });
-  }
-}
+  });
+});
 
-console.log(`[Monday] ✅ Normalized items: ${items.length}`);
-return { items };
-```
+const payload = { items };
+console.log(`[API] ✅ Tickets normalized: ${items.length} items`);
 
-})();
+// 2) Cache set
+cacheSet("monday_tickets", payload);
 
-try {
-const payload = await mondayCache.inFlight;
-mondayCache.value = payload;
-mondayCache.ts = Date.now();
-mondayCache.inFlight = null;
-
-```
 res.json(payload);
 ```
 
 } catch (error) {
-mondayCache.inFlight = null;
-console.error("[Monday] ❌ Fetch error:", error.message);
-
-```
-if (error.details) {
-  return res.status(400).json({ errors: error.details });
-}
+console.error("[API] ❌ Fetch error:", error.message);
 res.status(500).json({ error: "Failed to fetch Monday tickets" });
-```
-
 }
 });
 
@@ -348,6 +317,7 @@ const authUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/autho
 )}&response_type=code&scope=Mail.Read Mail.Send offline_access`;
 
 console.log("[Outlook] ✅ OAuth URL generated");
+
 res.json({ authUrl });
 ```
 
