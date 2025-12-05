@@ -1,10 +1,19 @@
 /**
  * AFI OPS Backend (Render / Local)
- * - Twilio Voice Token (JWT moderne)
- * - TwiML Voice endpoint
- * - Monday tickets proxy normalisé (avec cache TTL)
- *   ✅ Compatible Monday API 2025: items_page NE supporte plus group_ids
- *   → On filtre côté backend sur group.id (ex: "topics")
+ * ------------------------------------------------------------
+ * FEATURES:
+ * ✅ Health check
+ * ✅ Twilio Voice Token (JWT moderne)
+ * ✅ TwiML Voice endpoint (outgoing + incoming)
+ * ✅ Monday tickets proxy normalisé + cache TTL
+ * ✅ Monday Create Ticket (group topics) selon mapping Paperform
+ * ✅ Outlook OAuth URL helper (placeholder)
+ * ✅ Tidio config helper
+ *
+ * IMPORTANT:
+ * - Monday API: on utilise items_page au niveau du board
+ *   (items sur Board n'existe pas -> ton erreur 400)
+ * - group_ids n'existe pas sur items_page -> on filtre côté backend
  */
 
 const express = require("express");
@@ -15,11 +24,15 @@ require("dotenv").config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 10000;
-const baseUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+const baseUrl =
+  process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 
+/* ============================================================
+   LOG ENV CHECK
+============================================================ */
 console.log("🚀 AFI OPS Backend starting...");
 console.log("ENV vars loaded:", {
   TWILIO_ACCOUNT_SID: process.env.TWILIO_ACCOUNT_SID ? "✓" : "✗",
@@ -29,33 +42,27 @@ console.log("ENV vars loaded:", {
   TWILIO_PHONE_NUMBER: process.env.TWILIO_PHONE_NUMBER ? "✓" : "✗",
   MONDAY_TOKEN: process.env.MONDAY_TOKEN ? "✓" : "✗",
   MONDAY_BOARD_ID: process.env.MONDAY_BOARD_ID ? "✓" : "⚠️ fallback",
-  MONDAY_TTL_MS: process.env.MONDAY_TTL_MS || "25000",
-  MONDAY_ITEMS_LIMIT: process.env.MONDAY_ITEMS_LIMIT || "50",
+  MONDAY_TTL_MS: process.env.MONDAY_TTL_MS ? "✓" : "default 25s",
+  MONDAY_ITEMS_LIMIT: process.env.MONDAY_ITEMS_LIMIT ? "✓" : "default 50",
   RENDER_EXTERNAL_URL: process.env.RENDER_EXTERNAL_URL ? "✓" : "⚠️ local",
 });
 
-/* ================================
-   HEALTH CHECK
-================================ */
+/* ============================================================
+   0) HEALTH CHECK
+============================================================ */
 app.get("/", (req, res) => {
   res.json({
     status: "AFI OPS Backend OK",
     timestamp: new Date().toISOString(),
-    endpoints: {
-      mondayTickets: "/api/monday/tickets?groupId=topics",
-      twilioToken: "/api/twilio-token",
-      voiceTwiml: "/api/voice",
-      outlookAuth: "/api/outlook-auth",
-      tidioConfig: "/api/tidio-config",
-    },
+    baseUrl,
   });
 });
 
-/* ================================
-   TWILIO TOKEN (VoIP)
+/* ============================================================
+   1) TWILIO TOKEN (VoIP)
    POST /api/twilio-token
    Body optionnel: { identity: "max" }
-================================ */
+============================================================ */
 app.post("/api/twilio-token", (req, res) => {
   try {
     console.log("[Twilio] 🔐 Generating token...");
@@ -75,7 +82,8 @@ app.post("/api/twilio-token", (req, res) => {
       !TWILIO_TWIML_APP_SID
     ) {
       return res.status(500).json({
-        error: "Missing Twilio env vars. Check TWILIO_* in Render.",
+        error:
+          "Missing Twilio env vars. Check TWILIO_* in Render.",
       });
     }
 
@@ -86,8 +94,8 @@ app.post("/api/twilio-token", (req, res) => {
 
     const token = new AccessToken(
       TWILIO_ACCOUNT_SID,
-      TWILIO_API_KEY, // doit être SK...
-      TWILIO_API_SECRET, // secret de la SK
+      TWILIO_API_KEY, // SK...
+      TWILIO_API_SECRET,
       { identity }
     );
 
@@ -99,7 +107,7 @@ app.post("/api/twilio-token", (req, res) => {
     );
 
     const jwtToken = token.toJwt();
-    console.log("[Twilio] ✅ Token generated for identity:", identity);
+    console.log("[Twilio] ✅ Token generated for:", identity);
 
     res.json({
       token: jwtToken,
@@ -114,10 +122,10 @@ app.post("/api/twilio-token", (req, res) => {
   }
 });
 
-/* ================================
-   TWIML VOICE (Logique d'appel)
+/* ============================================================
+   2) TWIML VOICE
    POST /api/voice
-================================ */
+============================================================ */
 app.post("/api/voice", (req, res) => {
   try {
     console.log("[Voice] 📞 Incoming TwiML request...");
@@ -136,14 +144,16 @@ app.post("/api/voice", (req, res) => {
 
       if (/^[\d\+\-\(\) ]+$/.test(To)) {
         dial.number(To);
-        console.log(`[Voice] ✅ Dialing phone number: ${To}`);
+        console.log(`[Voice] ✅ Dialing number: ${To}`);
       } else {
         dial.client(To);
         console.log(`[Voice] ✅ Dialing client: ${To}`);
       }
     } else {
-      response.say("Merci d'appeler AFI OPS. Aucun destinataire spécifié.");
-      console.log("[Voice] ⚠️ No destination provided");
+      response.say(
+        "Merci d'appeler AFI OPS. Aucun destinataire spécifié."
+      );
+      console.log("[Voice] ⚠️ No destination");
     }
 
     res.type("text/xml");
@@ -154,68 +164,99 @@ app.post("/api/voice", (req, res) => {
   }
 });
 
-/* ================================
-   MONDAY TICKETS + CACHE TTL
-   GET /api/monday/tickets?groupId=topics
-   ✅ Retourne { ok, groupId, items: [...] }
-   ⚠️ Monday API 2025 ne supporte plus group_ids dans items_page
-   Donc: on fetch tout + filter backend
-================================ */
+/* ============================================================
+   3) MONDAY HELPERS
+============================================================ */
+const MONDAY_URL = "https://api.monday.com/v2";
+const MONDAY_API_VERSION =
+  process.env.MONDAY_API_VERSION || "2023-10";
 
-// Cache mémoire simple
+function mondayHeaders() {
+  if (!process.env.MONDAY_TOKEN) {
+    throw new Error("Missing MONDAY_TOKEN");
+  }
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${process.env.MONDAY_TOKEN}`,
+    "API-Version": MONDAY_API_VERSION,
+  };
+}
+
+async function mondayRequest(query, variables) {
+  const res = await axios.post(
+    MONDAY_URL,
+    { query, variables },
+    { headers: mondayHeaders(), timeout: 15000 }
+  );
+  return res.data;
+}
+
+/* ============================================================
+   4) MONDAY TICKETS PROXY + CACHE TTL
+   GET /api/monday/tickets
+   ✅ Retourne { items: [...] }
+   - Utilise items_page (valide)
+   - Ajoute group { id title }
+   - Filtre sur topics si demandé
+============================================================ */
 const mondayCache = {
   data: null,
   expiresAt: 0,
+  lastBoardId: null,
   lastGroupId: null,
 };
 
-const MONDAY_TTL_MS = Number(process.env.MONDAY_TTL_MS || 25000); // 25s par défaut
-const MONDAY_ITEMS_LIMIT = Number(process.env.MONDAY_ITEMS_LIMIT || 200); // on peut monter un peu ici
+const MONDAY_TTL_MS = Number(
+  process.env.MONDAY_TTL_MS || 25000
+);
+const MONDAY_ITEMS_LIMIT = Number(
+  process.env.MONDAY_ITEMS_LIMIT || 50
+);
+const DEFAULT_BOARD_ID = Number(
+  process.env.MONDAY_BOARD_ID || 1763228524
+);
+const DEFAULT_GROUP_ID =
+  process.env.MONDAY_GROUP_ID || "topics";
 
 app.get("/api/monday/tickets", async (req, res) => {
-  console.log("[API] 📅 Fetching tickets from Monday (Proxy)...");
+  console.log("[API] 📅 Fetching tickets from Monday...");
 
-  if (!process.env.MONDAY_TOKEN) {
-    console.error("❌ MONDAY_TOKEN manquant !");
-    return res
-      .status(500)
-      .json({ ok: false, error: "Server misconfigured (missing MONDAY_TOKEN)" });
-  }
-
-  const boardId = process.env.MONDAY_BOARD_ID || 1763228524; // ton vrai board
-  const groupId = req.query.groupId || "topics"; // default = topics (Nouvelles demandes)
-
-  // Serve cache si valide ET même groupId
   const now = Date.now();
+  const boardId = Number(req.query.boardId || DEFAULT_BOARD_ID);
+  const groupId = String(req.query.groupId || DEFAULT_GROUP_ID);
+
+  // Cache HIT ?
   if (
     mondayCache.data &&
     mondayCache.expiresAt > now &&
+    mondayCache.lastBoardId === boardId &&
     mondayCache.lastGroupId === groupId
   ) {
     console.log("[API] 🧠 Monday cache HIT");
     return res.json(mondayCache.data);
   }
 
-  // Query compatible API 2025
+  // Query VALIDÉE (items_page)
   const query = `
-    query ($boardId: [ID!], $limit: Int!) {
-      boards(ids: $boardId) {
+    query ($boardId: ID!, $limit: Int!) {
+      boards(ids: [$boardId]) {
         id
         name
-        groups {
-          id
-          title
-        }
-        items(limit: $limit) {
-          id
-          name
-          updated_at
-          group { id title }
-          column_values {
+        items_page(limit: $limit) {
+          items {
             id
-            text
-            type
-            value
+            name
+            updated_at
+            group {
+              id
+              title
+            }
+            column_values {
+              id
+              text
+              type
+              value
+            }
           }
         }
       }
@@ -223,40 +264,31 @@ app.get("/api/monday/tickets", async (req, res) => {
   `;
 
   try {
-    const response = await axios.post(
-      "https://api.monday.com/v2",
-      { query, variables: { boardId, limit: MONDAY_ITEMS_LIMIT } },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${process.env.MONDAY_TOKEN}`,
-          "API-Version": "2023-10",
-        },
-        timeout: 15000,
-      }
-    );
+    const data = await mondayRequest(query, {
+      boardId,
+      limit: MONDAY_ITEMS_LIMIT,
+    });
 
-    if (response.data.errors) {
-      console.error("[API] ❌ Monday errors:", response.data.errors);
-      return res.status(400).json({ ok: false, errors: response.data.errors });
+    if (data.errors) {
+      console.error("[API] ❌ Monday errors:", data.errors);
+      return res.status(400).json({ errors: data.errors });
     }
 
-    const board = response.data?.data?.boards?.[0];
+    const board = data?.data?.boards?.[0];
     if (!board) {
-      console.warn("[API] ⚠️ No board returned from Monday");
-      const empty = { ok: true, groupId, items: [] };
+      console.warn("[API] ⚠️ No board returned");
+      const empty = { items: [] };
       mondayCache.data = empty;
       mondayCache.expiresAt = now + MONDAY_TTL_MS;
+      mondayCache.lastBoardId = boardId;
       mondayCache.lastGroupId = groupId;
       return res.json(empty);
     }
 
-    // Filtrer côté backend par group.id
-    const rawItems = (board.items || []).filter(
-      (item) => item.group?.id === groupId
-    );
+    const rawItems = board.items_page?.items || [];
 
-    const items = rawItems.map((item) => {
+    // Normalisation colMap
+    const normalized = rawItems.map((item) => {
       const cols = item.column_values || [];
       const colMap = {};
       cols.forEach((col) => {
@@ -272,45 +304,166 @@ app.get("/api/monday/tickets", async (req, res) => {
         id: item.id,
         name: item.name,
         updated_at: item.updated_at,
-        group: item.group,
+        group: item.group || null,
         column_values: colMap,
       };
     });
 
-    const payload = { ok: true, groupId, items };
+    // Filtre group topics (ou autre groupId)
+    const items =
+      groupId === "all"
+        ? normalized
+        : normalized.filter((it) => it.group?.id === groupId);
 
-    // Store cache
+    const payload = { items };
+
     mondayCache.data = payload;
     mondayCache.expiresAt = now + MONDAY_TTL_MS;
+    mondayCache.lastBoardId = boardId;
     mondayCache.lastGroupId = groupId;
 
     console.log(
-      `[API] ✅ Tickets normalized: ${items.length} items from group "${groupId}" (cache TTL ${MONDAY_TTL_MS}ms)`
+      `[API] ✅ Tickets normalized: ${items.length}/${normalized.length} items (group=${groupId})`
     );
-
     res.json(payload);
   } catch (error) {
     console.error("[API] ❌ Fetch error:", error.message);
-    res
-      .status(500)
-      .json({ ok: false, error: "Failed to fetch Monday tickets" });
+    res.status(500).json({
+      error: "Failed to fetch Monday tickets",
+      details: error.message,
+    });
   }
 });
 
-/* ================================
-   OUTLOOK TOKEN (OAuth)
-================================ */
+/* ============================================================
+   5) MONDAY CREATE TICKET (Paperform -> topics)
+   POST /api/monday/create-ticket
+   Body JSON reçu de Paperform:
+     {
+       full_name, phone, email, address,
+       issue_description, intent, language,
+       zap_meta_timestamp
+     }
+============================================================ */
+const INTENT_MAP = {
+  service: "🔧 Service",
+  warranty: "🛡️ Garantie",
+  parts: "🔩 Pièce",
+  quote: "💰 Soumission",
+};
+
+const LANGUAGE_MAP = {
+  fr: "🃏 Français",
+  en: "🇬🇧 English",
+};
+
+app.post("/api/monday/create-ticket", async (req, res) => {
+  console.log("[API] 🧾 Creating Monday ticket...");
+
+  const boardId = Number(req.body.boardId || DEFAULT_BOARD_ID);
+  const groupId = String(req.body.groupId || DEFAULT_GROUP_ID);
+
+  const {
+    full_name,
+    phone,
+    email,
+    address,
+    issue_description,
+    intent,
+    language,
+    zap_meta_timestamp,
+  } = req.body || {};
+
+  if (!full_name || !intent) {
+    return res.status(400).json({
+      error: "Missing required fields: full_name, intent",
+    });
+  }
+
+  const mapped_intent = INTENT_MAP[intent] || intent;
+  const mapped_language = LANGUAGE_MAP[language] || language;
+
+  const item_name = `Ticket AFI – ${full_name} – ${intent}`;
+
+  const column_values = {
+    text_mkx51q5v: full_name || "",
+    phone_mkx5xy3x: phone || "",
+    email_mkx53410: email || "",
+    text_mkx528gx: address || "",
+    long_text_mkx59qsr: issue_description || "",
+    status: mapped_intent,
+    color_mkx5e9jt: mapped_language,
+    date_mkx5asat:
+      zap_meta_timestamp ||
+      new Date().toISOString().split("T")[0],
+  };
+
+  const mutation = `
+    mutation ($boardId: ID!, $groupId: String!, $itemName: String!, $cols: JSON!) {
+      create_item(
+        board_id: $boardId,
+        group_id: $groupId,
+        item_name: $itemName,
+        column_values: $cols
+      ) {
+        id
+        name
+      }
+    }
+  `;
+
+  try {
+    const data = await mondayRequest(mutation, {
+      boardId,
+      groupId,
+      itemName: item_name,
+      cols: JSON.stringify(column_values),
+    });
+
+    if (data.errors) {
+      console.error("[API] ❌ Monday create errors:", data.errors);
+      return res.status(400).json({ errors: data.errors });
+    }
+
+    // bust cache
+    mondayCache.data = null;
+
+    const created = data?.data?.create_item;
+    console.log("[API] ✅ Ticket created:", created?.id);
+
+    res.json({
+      ok: true,
+      item: created,
+      item_name,
+      column_values,
+      boardId,
+      groupId,
+    });
+  } catch (e) {
+    console.error("[API] ❌ Create ticket failed:", e.message);
+    res.status(500).json({
+      ok: false,
+      error: "Failed to create Monday ticket",
+      details: e.message,
+    });
+  }
+});
+
+/* ============================================================
+   6) OUTLOOK TOKEN (OAuth) - placeholder
+   POST /api/outlook-auth
+============================================================ */
 app.post("/api/outlook-auth", (req, res) => {
   try {
     console.log("[Outlook] 🔐 Generating OAuth URL...");
 
     const clientId = process.env.OUTLOOK_CLIENT_ID;
     const tenantId = process.env.OUTLOOK_TENANT_ID;
-    const redirectUri = process.env.OUTLOOK_REDIRECT_URI || "https://codepen.io";
+    const redirectUri =
+      process.env.OUTLOOK_REDIRECT_URI || "https://codepen.io";
 
     if (!clientId || !tenantId) {
       return res.status(500).json({
-        ok: false,
         error: "Missing OUTLOOK_CLIENT_ID or OUTLOOK_TENANT_ID",
       });
     }
@@ -320,46 +473,49 @@ app.post("/api/outlook-auth", (req, res) => {
     )}&response_type=code&scope=Mail.Read Mail.Send offline_access`;
 
     console.log("[Outlook] ✅ OAuth URL generated");
-    res.json({ ok: true, authUrl });
+    res.json({ authUrl });
   } catch (e) {
     console.error("[Outlook] ❌ Error:", e.message);
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
-/* ================================
-   TIDIO CONFIG
-================================ */
+/* ============================================================
+   7) TIDIO CONFIG
+   GET /api/tidio-config
+============================================================ */
 app.get("/api/tidio-config", (req, res) => {
   try {
     console.log("[Tidio] 🔧 Fetching config...");
-
     const projectId = process.env.TIDIO_PROJECT_ID;
     if (!projectId) {
-      return res.status(500).json({ ok: false, error: "Missing TIDIO_PROJECT_ID" });
+      return res.status(500).json({
+        error: "Missing TIDIO_PROJECT_ID",
+      });
     }
-
-    res.json({ ok: true, projectId });
+    res.json({ projectId });
   } catch (e) {
     console.error("[Tidio] ❌ Error:", e.message);
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
-/* ================================
-   ERROR HANDLING
-================================ */
+/* ============================================================
+   8) ERROR HANDLING
+============================================================ */
 app.use((err, req, res, next) => {
   console.error("[Error]", err);
-  res.status(500).json({ ok: false, error: "Internal server error" });
+  res.status(500).json({
+    error: "Internal server error",
+    details: err.message,
+  });
 });
 
-/* ================================
-   START SERVER
-================================ */
+/* ============================================================
+   9) START SERVER
+============================================================ */
 app.listen(PORT, () => {
   console.log(`✅ Backend running on port ${PORT}`);
   console.log(`📍 URL: ${baseUrl}`);
   console.log(`📞 TwiML Voice URL: ${baseUrl}/api/voice`);
-  console.log(`📅 Monday Tickets URL: ${baseUrl}/api/monday/tickets?groupId=topics`);
 });
