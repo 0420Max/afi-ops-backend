@@ -3,7 +3,7 @@
  * ------------------------------------------------------------
  * FEATURES:
  * ✅ Health check
- * ✅ Twilio Voice Token (JWT moderne)
+ * ✅ Twilio Voice Token (JWT moderne, avec diagnostics)
  * ✅ TwiML Voice endpoint (outgoing + incoming)
  * ✅ Monday tickets proxy normalisé + cache TTL
  * ✅ Monday Create Ticket (group topics) selon mapping Paperform
@@ -31,21 +31,71 @@ const baseUrl =
   process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 
 /* ============================================================
+   ENV / CONFIG SNAPSHOT
+============================================================ */
+const {
+  TWILIO_ACCOUNT_SID,
+  TWILIO_API_KEY,
+  TWILIO_API_SECRET,
+  TWILIO_TWIML_APP_SID,
+  TWILIO_PHONE_NUMBER,
+  MONDAY_TOKEN,
+  MONDAY_BOARD_ID,
+  MONDAY_TTL_MS: MONDAY_TTL_MS_ENV,
+  MONDAY_ITEMS_LIMIT: MONDAY_ITEMS_LIMIT_ENV,
+  RENDER_EXTERNAL_URL,
+  MONDAY_API_VERSION: MONDAY_API_VERSION_ENV,
+  OUTLOOK_CLIENT_ID,
+  OUTLOOK_TENANT_ID,
+  OUTLOOK_REDIRECT_URI,
+  TIDIO_PROJECT_ID,
+  TWILIO_TOKEN_TTL,
+} = process.env;
+
+const MONDAY_TTL_MS = Number(MONDAY_TTL_MS_ENV || 25000);
+const MONDAY_ITEMS_LIMIT = Number(MONDAY_ITEMS_LIMIT_ENV || 50);
+const DEFAULT_BOARD_ID = Number(MONDAY_BOARD_ID || 1763228524);
+const DEFAULT_GROUP_ID =
+  process.env.MONDAY_GROUP_ID || "topics";
+const MONDAY_API_VERSION = MONDAY_API_VERSION_ENV || "2023-10";
+
+// Twilio toggle: on démarre le serveur même si Twilio est mal configuré,
+// mais on désactive uniquement les routes Twilio.
+const TWILIO_ENABLED =
+  !!TWILIO_ACCOUNT_SID &&
+  !!TWILIO_API_KEY &&
+  !!TWILIO_API_SECRET &&
+  !!TWILIO_TWIML_APP_SID;
+
+/* ============================================================
    LOG ENV CHECK
 ============================================================ */
 console.log("🚀 AFI OPS Backend starting...");
 console.log("ENV vars loaded:", {
-  TWILIO_ACCOUNT_SID: process.env.TWILIO_ACCOUNT_SID ? "✓" : "✗",
-  TWILIO_API_KEY: process.env.TWILIO_API_KEY ? "✓(SK...)" : "✗",
-  TWILIO_API_SECRET: process.env.TWILIO_API_SECRET ? "✓" : "✗",
-  TWILIO_TWIML_APP_SID: process.env.TWILIO_TWIML_APP_SID ? "✓(AP...)" : "✗",
-  TWILIO_PHONE_NUMBER: process.env.TWILIO_PHONE_NUMBER ? "✓" : "✗",
-  MONDAY_TOKEN: process.env.MONDAY_TOKEN ? "✓" : "✗",
-  MONDAY_BOARD_ID: process.env.MONDAY_BOARD_ID ? "✓" : "⚠️ fallback",
-  MONDAY_TTL_MS: process.env.MONDAY_TTL_MS ? "✓" : "default 25s",
-  MONDAY_ITEMS_LIMIT: process.env.MONDAY_ITEMS_LIMIT ? "✓" : "default 50",
-  RENDER_EXTERNAL_URL: process.env.RENDER_EXTERNAL_URL ? "✓" : "⚠️ local",
+  TWILIO_ACCOUNT_SID: TWILIO_ACCOUNT_SID ? "✓" : "✗",
+  TWILIO_API_KEY: TWILIO_API_KEY ? "✓(SK...)" : "✗",
+  TWILIO_API_SECRET: TWILIO_API_SECRET ? "✓" : "✗",
+  TWILIO_TWIML_APP_SID: TWILIO_TWIML_APP_SID ? "✓(AP...)" : "✗",
+  TWILIO_PHONE_NUMBER: TWILIO_PHONE_NUMBER ? "✓" : "✗",
+  MONDAY_TOKEN: MONDAY_TOKEN ? "✓" : "✗",
+  MONDAY_BOARD_ID: MONDAY_BOARD_ID ? "✓" : "⚠️ fallback",
+  MONDAY_TTL_MS: MONDAY_TTL_MS_ENV ? `✓ (${MONDAY_TTL_MS_ENV})` : "default 25s",
+  MONDAY_ITEMS_LIMIT: MONDAY_ITEMS_LIMIT_ENV
+    ? `✓ (${MONDAY_ITEMS_LIMIT_ENV})`
+    : "default 50",
+  RENDER_EXTERNAL_URL: RENDER_EXTERNAL_URL ? "✓" : "⚠️ local",
+  OUTLOOK_CLIENT_ID: OUTLOOK_CLIENT_ID ? "✓" : "✗",
+  OUTLOOK_TENANT_ID: OUTLOOK_TENANT_ID ? "✓" : "✗",
+  TIDIO_PROJECT_ID: TIDIO_PROJECT_ID ? "✓" : "✗",
+  TWILIO_TOKEN_TTL: TWILIO_TOKEN_TTL ? `✓ (${TWILIO_TOKEN_TTL}s)` : "default 3600s",
 });
+
+// Log Twilio readiness (diagnostic doux)
+if (!TWILIO_ENABLED) {
+  console.warn(
+    "⚠️ Twilio not fully configured. Softphone endpoints will return 503 until env vars are fixed."
+  );
+}
 
 /* ============================================================
    0) HEALTH CHECK
@@ -55,6 +105,36 @@ app.get("/", (req, res) => {
     status: "AFI OPS Backend OK",
     timestamp: new Date().toISOString(),
     baseUrl,
+    services: {
+      twilio: TWILIO_ENABLED ? "ready" : "disabled",
+      monday: !!MONDAY_TOKEN ? "ready" : "missing_token",
+      outlook:
+        OUTLOOK_CLIENT_ID && OUTLOOK_TENANT_ID ? "partial" : "not_configured",
+      tidio: !!TIDIO_PROJECT_ID ? "ready" : "not_configured",
+    },
+  });
+});
+
+/* ============================================================
+   0.1) TWILIO HEALTH (debug uniquement)
+============================================================ */
+app.get("/api/twilio/health", (req, res) => {
+  if (!TWILIO_ENABLED) {
+    return res.status(503).json({
+      ok: false,
+      errorCode: "TWILIO_CONFIG_INCOMPLETE",
+      message:
+        "Twilio env vars are incomplete. Check TWILIO_ACCOUNT_SID, TWILIO_API_KEY, TWILIO_API_SECRET, TWILIO_TWIML_APP_SID.",
+    });
+  }
+
+  res.json({
+    ok: true,
+    twilio: {
+      accountSid: TWILIO_ACCOUNT_SID.replace(/^(.{6}).+$/, "$1…"),
+      twimlAppSid: TWILIO_TWIML_APP_SID.replace(/^(.{4}).+$/, "$1…"),
+      tokenTtlSeconds: Number(TWILIO_TOKEN_TTL || 3600),
+    },
   });
 });
 
@@ -65,25 +145,14 @@ app.get("/", (req, res) => {
 ============================================================ */
 app.post("/api/twilio-token", (req, res) => {
   try {
-    console.log("[Twilio] 🔐 Generating token...");
+    console.log("[Twilio] 🔐 Token request received...");
 
-    const {
-      TWILIO_ACCOUNT_SID,
-      TWILIO_API_KEY,
-      TWILIO_API_SECRET,
-      TWILIO_TWIML_APP_SID,
-      TWILIO_PHONE_NUMBER,
-    } = process.env;
-
-    if (
-      !TWILIO_ACCOUNT_SID ||
-      !TWILIO_API_KEY ||
-      !TWILIO_API_SECRET ||
-      !TWILIO_TWIML_APP_SID
-    ) {
-      return res.status(500).json({
+    if (!TWILIO_ENABLED) {
+      console.warn("[Twilio] ❌ Twilio not configured, rejecting token request.");
+      return res.status(503).json({
+        errorCode: "TWILIO_CONFIG_INCOMPLETE",
         error:
-          "Missing Twilio env vars. Check TWILIO_* in Render.",
+          "Twilio is not fully configured on the backend. Check TWILIO_* env vars.",
       });
     }
 
@@ -92,11 +161,15 @@ app.post("/api/twilio-token", (req, res) => {
 
     const identity = req.body?.identity || "afi-agent";
 
+    const ttl = Number(TWILIO_TOKEN_TTL || 3600); // 1h par défaut
     const token = new AccessToken(
       TWILIO_ACCOUNT_SID,
       TWILIO_API_KEY, // SK...
       TWILIO_API_SECRET,
-      { identity }
+      {
+        identity,
+        ttl,
+      }
     );
 
     token.addGrant(
@@ -107,7 +180,12 @@ app.post("/api/twilio-token", (req, res) => {
     );
 
     const jwtToken = token.toJwt();
-    console.log("[Twilio] ✅ Token generated for:", identity);
+
+    // Log léger (sans exposer le token complet)
+    console.log("[Twilio] ✅ Token generated", {
+      identity,
+      ttlSeconds: ttl,
+    });
 
     res.json({
       token: jwtToken,
@@ -115,10 +193,14 @@ app.post("/api/twilio-token", (req, res) => {
       accountSid: TWILIO_ACCOUNT_SID,
       phoneNumber: TWILIO_PHONE_NUMBER || null,
       voiceUrl: `${baseUrl}/api/voice`,
+      ttlSeconds: ttl,
     });
   } catch (e) {
-    console.error("[Twilio] ❌ Token Error:", e.message);
-    res.status(500).json({ error: e.message });
+    console.error("[Twilio] ❌ Token Error:", e);
+    res.status(500).json({
+      errorCode: "TWILIO_TOKEN_ERROR",
+      error: e.message || "Failed to generate Twilio token",
+    });
   }
 });
 
@@ -130,6 +212,15 @@ app.post("/api/voice", (req, res) => {
   try {
     console.log("[Voice] 📞 Incoming TwiML request...");
 
+    if (!TWILIO_ENABLED) {
+      console.warn("[Voice] ❌ Twilio not configured, replying with basic message.");
+      const VoiceResponse = twilio.twiml.VoiceResponse;
+      const response = new VoiceResponse();
+      response.say("Le service d'appel AFI OPS n'est pas disponible pour le moment.");
+      res.type("text/xml");
+      return res.send(response.toString());
+    }
+
     const VoiceResponse = twilio.twiml.VoiceResponse;
     const response = new VoiceResponse();
     const { To } = req.body || {};
@@ -138,7 +229,7 @@ app.post("/api/voice", (req, res) => {
 
     if (To) {
       const dial = response.dial({
-        callerId: process.env.TWILIO_PHONE_NUMBER,
+        callerId: TWILIO_PHONE_NUMBER,
         timeout: 30,
       });
 
@@ -159,8 +250,11 @@ app.post("/api/voice", (req, res) => {
     res.type("text/xml");
     res.send(response.toString());
   } catch (e) {
-    console.error("[Voice] ❌ TwiML Error:", e.message);
-    res.status(500).json({ error: e.message });
+    console.error("[Voice] ❌ TwiML Error:", e);
+    res.status(500).json({
+      errorCode: "TWILIO_TWIML_ERROR",
+      error: e.message || "Failed to generate TwiML",
+    });
   }
 });
 
@@ -168,16 +262,14 @@ app.post("/api/voice", (req, res) => {
    3) MONDAY HELPERS
 ============================================================ */
 const MONDAY_URL = "https://api.monday.com/v2";
-const MONDAY_API_VERSION =
-  process.env.MONDAY_API_VERSION || "2023-10";
 
 function mondayHeaders() {
-  if (!process.env.MONDAY_TOKEN) {
+  if (!MONDAY_TOKEN) {
     throw new Error("Missing MONDAY_TOKEN");
   }
   return {
     "Content-Type": "application/json",
-    Authorization: `Bearer ${process.env.MONDAY_TOKEN}`,
+    Authorization: `Bearer ${MONDAY_TOKEN}`,
     "API-Version": MONDAY_API_VERSION,
   };
 }
@@ -205,18 +297,6 @@ const mondayCache = {
   lastBoardId: null,
   lastGroupId: null,
 };
-
-const MONDAY_TTL_MS = Number(
-  process.env.MONDAY_TTL_MS || 25000
-);
-const MONDAY_ITEMS_LIMIT = Number(
-  process.env.MONDAY_ITEMS_LIMIT || 50
-);
-const DEFAULT_BOARD_ID = Number(
-  process.env.MONDAY_BOARD_ID || 1763228524
-);
-const DEFAULT_GROUP_ID =
-  process.env.MONDAY_GROUP_ID || "topics";
 
 app.get("/api/monday/tickets", async (req, res) => {
   console.log("[API] 📅 Fetching tickets from Monday...");
@@ -457,13 +537,14 @@ app.post("/api/outlook-auth", (req, res) => {
   try {
     console.log("[Outlook] 🔐 Generating OAuth URL...");
 
-    const clientId = process.env.OUTLOOK_CLIENT_ID;
-    const tenantId = process.env.OUTLOOK_TENANT_ID;
+    const clientId = OUTLOOK_CLIENT_ID;
+    const tenantId = OUTLOOK_TENANT_ID;
     const redirectUri =
-      process.env.OUTLOOK_REDIRECT_URI || "https://codepen.io";
+      OUTLOOK_REDIRECT_URI || "https://codepen.io";
 
     if (!clientId || !tenantId) {
       return res.status(500).json({
+        errorCode: "OUTLOOK_CONFIG_INCOMPLETE",
         error: "Missing OUTLOOK_CLIENT_ID or OUTLOOK_TENANT_ID",
       });
     }
@@ -487,9 +568,10 @@ app.post("/api/outlook-auth", (req, res) => {
 app.get("/api/tidio-config", (req, res) => {
   try {
     console.log("[Tidio] 🔧 Fetching config...");
-    const projectId = process.env.TIDIO_PROJECT_ID;
+    const projectId = TIDIO_PROJECT_ID;
     if (!projectId) {
       return res.status(500).json({
+        errorCode: "TIDIO_CONFIG_INCOMPLETE",
         error: "Missing TIDIO_PROJECT_ID",
       });
     }
