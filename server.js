@@ -1,3 +1,10 @@
+/**
+ * AFI OPS Backend (Render / Local)
+ * - Twilio Voice Token (JWT moderne)
+ * - TwiML Voice endpoint
+ * - Monday tickets proxy normalisé
+ */
+
 const express = require("express");
 const twilio = require("twilio");
 const axios = require("axios");
@@ -11,11 +18,13 @@ app.use(express.json());
 console.log("🚀 AFI OPS Backend starting...");
 console.log("ENV vars loaded:", {
   TWILIO_ACCOUNT_SID: process.env.TWILIO_ACCOUNT_SID ? "✓" : "✗",
-  TWILIO_API_KEY: process.env.TWILIO_API_KEY ? "✓" : "✗",
+  TWILIO_API_KEY: process.env.TWILIO_API_KEY ? "✓(SK...)" : "✗",
   TWILIO_API_SECRET: process.env.TWILIO_API_SECRET ? "✓" : "✗",
-  TWILIO_TWIML_APP_SID: process.env.TWILIO_TWIML_APP_SID ? "✓" : "✗",
+  TWILIO_TWIML_APP_SID: process.env.TWILIO_TWIML_APP_SID ? "✓(AP...)" : "✗",
   TWILIO_PHONE_NUMBER: process.env.TWILIO_PHONE_NUMBER ? "✓" : "✗",
   MONDAY_TOKEN: process.env.MONDAY_TOKEN ? "✓" : "✗",
+  MONDAY_BOARD_ID: process.env.MONDAY_BOARD_ID ? "✓" : "⚠️ fallback",
+  RENDER_EXTERNAL_URL: process.env.RENDER_EXTERNAL_URL ? "✓" : "⚠️ local",
 });
 
 /* ================================
@@ -30,33 +39,55 @@ app.get("/", (req, res) => {
 
 /* ================================
    TWILIO TOKEN (VoIP)
+   POST /api/twilio-token
+   Body optionnel: { identity: "max" }
 ================================ */
 app.post("/api/twilio-token", (req, res) => {
   try {
     console.log("[Twilio] 🔐 Generating token...");
 
+    const {
+      TWILIO_ACCOUNT_SID,
+      TWILIO_API_KEY,
+      TWILIO_API_SECRET,
+      TWILIO_TWIML_APP_SID,
+      TWILIO_PHONE_NUMBER,
+    } = process.env;
+
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_API_KEY || !TWILIO_API_SECRET || !TWILIO_TWIML_APP_SID) {
+      return res.status(500).json({
+        error: "Missing Twilio env vars. Check TWILIO_* in Render.",
+      });
+    }
+
     const AccessToken = twilio.jwt.AccessToken;
     const VoiceGrant = AccessToken.VoiceGrant;
 
+    const identity = req.body?.identity || "afi-agent";
+
     const token = new AccessToken(
-      process.env.TWILIO_ACCOUNT_SID,
-      process.env.TWILIO_API_KEY,
-      process.env.TWILIO_API_SECRET
+      TWILIO_ACCOUNT_SID,
+      TWILIO_API_KEY,     // doit être SK...
+      TWILIO_API_SECRET,  // secret de la SK
+      { identity }
     );
 
     token.addGrant(
       new VoiceGrant({
-        outgoingApplicationSid: process.env.TWILIO_TWIML_APP_SID,
+        outgoingApplicationSid: TWILIO_TWIML_APP_SID, // AP...
+        incomingAllow: true,
       })
     );
 
     const jwtToken = token.toJwt();
-    console.log("[Twilio] ✅ Token generated successfully");
+    console.log("[Twilio] ✅ Token generated for identity:", identity);
 
     res.json({
       token: jwtToken,
-      accountSid: process.env.TWILIO_ACCOUNT_SID,
-      phoneNumber: process.env.TWILIO_PHONE_NUMBER,
+      identity,
+      accountSid: TWILIO_ACCOUNT_SID,
+      phoneNumber: TWILIO_PHONE_NUMBER || null,
+      voiceUrl: `${process.env.RENDER_EXTERNAL_URL || `http://localhost:${process.env.PORT || 10000}`}/api/voice`
     });
   } catch (e) {
     console.error("[Twilio] ❌ Token Error:", e.message);
@@ -66,6 +97,7 @@ app.post("/api/twilio-token", (req, res) => {
 
 /* ================================
    TWIML VOICE (Logique d'appel)
+   POST /api/voice
    ✅ Gère les appels sortants depuis le navigateur
 ================================ */
 app.post("/api/voice", (req, res) => {
@@ -74,7 +106,7 @@ app.post("/api/voice", (req, res) => {
 
     const VoiceResponse = twilio.twiml.VoiceResponse;
     const response = new VoiceResponse();
-    const { To } = req.body;
+    const { To } = req.body || {};
 
     console.log(`[Voice] Dialing to: ${To}`);
 
@@ -105,70 +137,8 @@ app.post("/api/voice", (req, res) => {
 });
 
 /* ================================
-   MONDAY TICKETS (POST - ANCIEN)
-================================ */
-app.post("/api/monday-tickets", async (req, res) => {
-  try {
-    console.log("[Monday] 📅 Fetching tickets (POST)...");
-
-    const query = `
-      query ($boardId: ID!) {
-        boards(ids: [$boardId]) {
-          id
-          name
-          groups {
-            id
-            title
-            items_page(limit: 100) {
-              items {
-                id
-                name
-                created_at
-                updated_at
-                column_values {
-                  id
-                  text
-                  type
-                  value
-                }
-              }
-            }
-          }
-        }
-      }
-    `;
-
-    const response = await axios.post(
-      "https://api.monday.com/v2",
-      {
-        query,
-        variables: { boardId: process.env.MONDAY_BOARD_ID },
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${process.env.MONDAY_TOKEN}`,
-        },
-      }
-    );
-
-    if (response.data.errors) {
-      console.error("[Monday] ❌ GraphQL errors:", response.data.errors);
-      return res.status(400).json({ errors: response.data.errors });
-    }
-
-    const board = response.data.data.boards[0];
-    console.log(`[Monday] ✅ ${board.groups.length} groups fetched (POST)`);
-
-    res.json({ board });
-  } catch (e) {
-    console.error("[Monday] ❌ Error:", e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-/* ================================
    MONDAY TICKETS (GET - PROXY NORMALISÉ)
+   GET /api/monday/tickets
    ✅ Retourne { items: [...] } pour le front
 ================================ */
 app.get("/api/monday/tickets", async (req, res) => {
@@ -191,7 +161,7 @@ app.get("/api/monday/tickets", async (req, res) => {
         groups {
           id
           title
-          items_page(limit: 50) {
+          items_page(limit: 100) {
             items {
               id
               name
@@ -218,7 +188,9 @@ app.get("/api/monday/tickets", async (req, res) => {
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${process.env.MONDAY_TOKEN}`,
+          "API-Version": "2023-10",
         },
+        timeout: 15000,
       }
     );
 
@@ -227,14 +199,22 @@ app.get("/api/monday/tickets", async (req, res) => {
       return res.status(400).json({ errors: response.data.errors });
     }
 
-    const apiData = response.data;
-    const boards = apiData?.data?.boards || [];
+    const boards = response.data?.data?.boards || [];
     const board = boards[0];
 
     if (!board) {
       console.warn("[API] ⚠️ No board returned from Monday");
       return res.json({ items: [] });
     }
+
+    console.log("[API] Board:", board.id, board.name);
+
+    // Log de debug: où sont les items?
+    board.groups?.forEach((g) => {
+      console.log(
+        ` - group ${g.id} (${g.title}) items: ${g.items_page?.items?.length || 0}`
+      );
+    });
 
     const items = [];
 
@@ -258,6 +238,7 @@ app.get("/api/monday/tickets", async (req, res) => {
           created_at: item.created_at,
           updated_at: item.updated_at,
           column_values: colMap,
+          _group: { id: group.id, title: group.title }, // utile pour debug front
         });
       });
     });
@@ -282,6 +263,12 @@ app.post("/api/outlook-auth", (req, res) => {
     const redirectUri =
       process.env.OUTLOOK_REDIRECT_URI || "https://codepen.io";
 
+    if (!clientId || !tenantId) {
+      return res.status(500).json({
+        error: "Missing OUTLOOK_CLIENT_ID or OUTLOOK_TENANT_ID",
+      });
+    }
+
     const authUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(
       redirectUri
     )}&response_type=code&scope=Mail.Read Mail.Send offline_access`;
@@ -303,8 +290,9 @@ app.get("/api/tidio-config", (req, res) => {
     console.log("[Tidio] 🔧 Fetching config...");
 
     const projectId = process.env.TIDIO_PROJECT_ID;
-
-    console.log("[Tidio] ✅ Config ready");
+    if (!projectId) {
+      return res.status(500).json({ error: "Missing TIDIO_PROJECT_ID" });
+    }
 
     res.json({ projectId });
   } catch (e) {
@@ -326,11 +314,9 @@ app.use((err, req, res, next) => {
 ================================ */
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
+  const baseUrl =
+    process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
   console.log(`✅ Backend running on port ${PORT}`);
-  console.log(`📍 URL: http://localhost:${PORT}`);
-  console.log(
-    `📞 TwiML Voice URL: ${
-      process.env.RENDER_EXTERNAL_URL || "http://localhost:" + PORT
-    }/api/voice`
-  );
+  console.log(`📍 URL: ${baseUrl}`);
+  console.log(`📞 TwiML Voice URL: ${baseUrl}/api/voice`);
 });
