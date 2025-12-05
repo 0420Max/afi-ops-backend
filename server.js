@@ -2,9 +2,9 @@
  * AFI OPS Backend (Render / Local)
  * - Twilio Voice Token (JWT moderne)
  * - TwiML Voice endpoint
- * - Monday tickets proxy normalisé (avec cache TTL + filtre group)
- * - Outlook OAuth URL generator
- * - Tidio config endpoint
+ * - Monday tickets proxy normalisé (avec cache TTL)
+ *   ✅ Compatible Monday API 2025: items_page NE supporte plus group_ids
+ *   → On filtre côté backend sur group.id (ex: "topics")
  */
 
 const express = require("express");
@@ -17,20 +17,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* ================================
-   CONFIG / ENV
-================================ */
 const PORT = process.env.PORT || 10000;
 const baseUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 
-const MONDAY_TTL_MS = Number(process.env.MONDAY_TTL_MS || 25000); // 25s par défaut
-const MONDAY_ITEMS_LIMIT = Number(process.env.MONDAY_ITEMS_LIMIT || 50);
-const MONDAY_DEFAULT_BOARD_ID = Number(process.env.MONDAY_BOARD_ID || 1763228524);
-const MONDAY_DEFAULT_GROUP_ID = process.env.MONDAY_GROUP_ID || "topics"; // "Nouvelles demandes"
-
-/* ================================
-   BOOT LOGS
-================================ */
 console.log("🚀 AFI OPS Backend starting...");
 console.log("ENV vars loaded:", {
   TWILIO_ACCOUNT_SID: process.env.TWILIO_ACCOUNT_SID ? "✓" : "✗",
@@ -40,10 +29,8 @@ console.log("ENV vars loaded:", {
   TWILIO_PHONE_NUMBER: process.env.TWILIO_PHONE_NUMBER ? "✓" : "✗",
   MONDAY_TOKEN: process.env.MONDAY_TOKEN ? "✓" : "✗",
   MONDAY_BOARD_ID: process.env.MONDAY_BOARD_ID ? "✓" : "⚠️ fallback",
-  MONDAY_GROUP_ID: process.env.MONDAY_GROUP_ID ? "✓" : "⚠️ topics",
-  OUTLOOK_CLIENT_ID: process.env.OUTLOOK_CLIENT_ID ? "✓" : "⚠️ none",
-  OUTLOOK_TENANT_ID: process.env.OUTLOOK_TENANT_ID ? "✓" : "⚠️ none",
-  TIDIO_PROJECT_ID: process.env.TIDIO_PROJECT_ID ? "✓" : "⚠️ none",
+  MONDAY_TTL_MS: process.env.MONDAY_TTL_MS || "25000",
+  MONDAY_ITEMS_LIMIT: process.env.MONDAY_ITEMS_LIMIT || "50",
   RENDER_EXTERNAL_URL: process.env.RENDER_EXTERNAL_URL ? "✓" : "⚠️ local",
 });
 
@@ -54,7 +41,13 @@ app.get("/", (req, res) => {
   res.json({
     status: "AFI OPS Backend OK",
     timestamp: new Date().toISOString(),
-    baseUrl,
+    endpoints: {
+      mondayTickets: "/api/monday/tickets?groupId=topics",
+      twilioToken: "/api/twilio-token",
+      voiceTwiml: "/api/voice",
+      outlookAuth: "/api/outlook-auth",
+      tidioConfig: "/api/tidio-config",
+    },
   });
 });
 
@@ -75,9 +68,13 @@ app.post("/api/twilio-token", (req, res) => {
       TWILIO_PHONE_NUMBER,
     } = process.env;
 
-    if (!TWILIO_ACCOUNT_SID || !TWILIO_API_KEY || !TWILIO_API_SECRET || !TWILIO_TWIML_APP_SID) {
+    if (
+      !TWILIO_ACCOUNT_SID ||
+      !TWILIO_API_KEY ||
+      !TWILIO_API_SECRET ||
+      !TWILIO_TWIML_APP_SID
+    ) {
       return res.status(500).json({
-        ok: false,
         error: "Missing Twilio env vars. Check TWILIO_* in Render.",
       });
     }
@@ -89,8 +86,8 @@ app.post("/api/twilio-token", (req, res) => {
 
     const token = new AccessToken(
       TWILIO_ACCOUNT_SID,
-      TWILIO_API_KEY,     // SK...
-      TWILIO_API_SECRET,  // secret de la SK
+      TWILIO_API_KEY, // doit être SK...
+      TWILIO_API_SECRET, // secret de la SK
       { identity }
     );
 
@@ -105,7 +102,6 @@ app.post("/api/twilio-token", (req, res) => {
     console.log("[Twilio] ✅ Token generated for identity:", identity);
 
     res.json({
-      ok: true,
       token: jwtToken,
       identity,
       accountSid: TWILIO_ACCOUNT_SID,
@@ -114,7 +110,7 @@ app.post("/api/twilio-token", (req, res) => {
     });
   } catch (e) {
     console.error("[Twilio] ❌ Token Error:", e.message);
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -154,66 +150,72 @@ app.post("/api/voice", (req, res) => {
     res.send(response.toString());
   } catch (e) {
     console.error("[Voice] ❌ TwiML Error:", e.message);
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
 /* ================================
    MONDAY TICKETS + CACHE TTL
-   GET /api/monday/tickets
-   ✅ Retourne { ok:true, items:[...] }
-   ✅ Filtre groupId = topics par défaut
+   GET /api/monday/tickets?groupId=topics
+   ✅ Retourne { ok, groupId, items: [...] }
+   ⚠️ Monday API 2025 ne supporte plus group_ids dans items_page
+   Donc: on fetch tout + filter backend
 ================================ */
 
 // Cache mémoire simple
 const mondayCache = {
   data: null,
   expiresAt: 0,
+  lastGroupId: null,
 };
+
+const MONDAY_TTL_MS = Number(process.env.MONDAY_TTL_MS || 25000); // 25s par défaut
+const MONDAY_ITEMS_LIMIT = Number(process.env.MONDAY_ITEMS_LIMIT || 200); // on peut monter un peu ici
 
 app.get("/api/monday/tickets", async (req, res) => {
   console.log("[API] 📅 Fetching tickets from Monday (Proxy)...");
 
-  const token = process.env.MONDAY_TOKEN;
-  if (!token) {
+  if (!process.env.MONDAY_TOKEN) {
     console.error("❌ MONDAY_TOKEN manquant !");
-    return res.status(500).json({
-      ok: false,
-      error: "Server misconfigured (missing MONDAY_TOKEN)",
-    });
+    return res
+      .status(500)
+      .json({ ok: false, error: "Server misconfigured (missing MONDAY_TOKEN)" });
   }
 
-  // TTL Cache
+  const boardId = process.env.MONDAY_BOARD_ID || 1763228524; // ton vrai board
+  const groupId = req.query.groupId || "topics"; // default = topics (Nouvelles demandes)
+
+  // Serve cache si valide ET même groupId
   const now = Date.now();
-  if (mondayCache.data && mondayCache.expiresAt > now) {
+  if (
+    mondayCache.data &&
+    mondayCache.expiresAt > now &&
+    mondayCache.lastGroupId === groupId
+  ) {
     console.log("[API] 🧠 Monday cache HIT");
     return res.json(mondayCache.data);
   }
 
-  const boardId = Number(req.query.boardId || MONDAY_DEFAULT_BOARD_ID);
-  const groupId = String(req.query.groupId || MONDAY_DEFAULT_GROUP_ID);
-
-  // ✅ Query correcte Monday (items_page + group_ids)
+  // Query compatible API 2025
   const query = `
-    query ($boardId: ID!, $limit: Int!, $groupIds: [String!]) {
-      boards(ids: [$boardId]) {
+    query ($boardId: [ID!], $limit: Int!) {
+      boards(ids: $boardId) {
         id
         name
-        items_page(
-          limit: $limit,
-          query_params: { group_ids: $groupIds }
-        ) {
-          items {
+        groups {
+          id
+          title
+        }
+        items(limit: $limit) {
+          id
+          name
+          updated_at
+          group { id title }
+          column_values {
             id
-            name
-            updated_at
-            group { id title }
-            column_values {
-              id
-              text
-              type
-              value
-            }
+            text
+            type
+            value
           }
         }
       }
@@ -223,18 +225,11 @@ app.get("/api/monday/tickets", async (req, res) => {
   try {
     const response = await axios.post(
       "https://api.monday.com/v2",
-      {
-        query,
-        variables: {
-          boardId,
-          limit: MONDAY_ITEMS_LIMIT,
-          groupIds: [groupId],
-        },
-      },
+      { query, variables: { boardId, limit: MONDAY_ITEMS_LIMIT } },
       {
         headers: {
           "Content-Type": "application/json",
-          Authorization: token, // pas Bearer sinon ok aussi
+          Authorization: `Bearer ${process.env.MONDAY_TOKEN}`,
           "API-Version": "2023-10",
         },
         timeout: 15000,
@@ -243,24 +238,24 @@ app.get("/api/monday/tickets", async (req, res) => {
 
     if (response.data.errors) {
       console.error("[API] ❌ Monday errors:", response.data.errors);
-      return res.status(400).json({
-        ok: false,
-        errors: response.data.errors,
-      });
+      return res.status(400).json({ ok: false, errors: response.data.errors });
     }
 
     const board = response.data?.data?.boards?.[0];
     if (!board) {
       console.warn("[API] ⚠️ No board returned from Monday");
-      const empty = { ok: true, items: [] };
+      const empty = { ok: true, groupId, items: [] };
       mondayCache.data = empty;
       mondayCache.expiresAt = now + MONDAY_TTL_MS;
+      mondayCache.lastGroupId = groupId;
       return res.json(empty);
     }
 
-    const rawItems = board.items_page?.items || [];
+    // Filtrer côté backend par group.id
+    const rawItems = (board.items || []).filter(
+      (item) => item.group?.id === groupId
+    );
 
-    // Normalisation: column_values -> map par id
     const items = rawItems.map((item) => {
       const cols = item.column_values || [];
       const colMap = {};
@@ -277,38 +272,33 @@ app.get("/api/monday/tickets", async (req, res) => {
         id: item.id,
         name: item.name,
         updated_at: item.updated_at,
-        group: item.group || null,
+        group: item.group,
         column_values: colMap,
       };
     });
 
-    const payload = {
-      ok: true,
-      board: { id: board.id, name: board.name },
-      groupId,
-      items,
-    };
+    const payload = { ok: true, groupId, items };
 
+    // Store cache
     mondayCache.data = payload;
     mondayCache.expiresAt = now + MONDAY_TTL_MS;
+    mondayCache.lastGroupId = groupId;
 
     console.log(
-      `[API] ✅ Tickets normalized: ${items.length} items (group ${groupId}, TTL ${MONDAY_TTL_MS}ms)`
+      `[API] ✅ Tickets normalized: ${items.length} items from group "${groupId}" (cache TTL ${MONDAY_TTL_MS}ms)`
     );
+
     res.json(payload);
   } catch (error) {
-    console.error("[API] ❌ Fetch error:", error.response?.data || error.message);
-    res.status(500).json({
-      ok: false,
-      error: "Failed to fetch Monday tickets",
-      details: error.response?.data || error.message,
-    });
+    console.error("[API] ❌ Fetch error:", error.message);
+    res
+      .status(500)
+      .json({ ok: false, error: "Failed to fetch Monday tickets" });
   }
 });
 
 /* ================================
    OUTLOOK TOKEN (OAuth)
-   POST /api/outlook-auth
 ================================ */
 app.post("/api/outlook-auth", (req, res) => {
   try {
@@ -316,8 +306,7 @@ app.post("/api/outlook-auth", (req, res) => {
 
     const clientId = process.env.OUTLOOK_CLIENT_ID;
     const tenantId = process.env.OUTLOOK_TENANT_ID;
-    const redirectUri =
-      process.env.OUTLOOK_REDIRECT_URI || "https://codepen.io";
+    const redirectUri = process.env.OUTLOOK_REDIRECT_URI || "https://codepen.io";
 
     if (!clientId || !tenantId) {
       return res.status(500).json({
@@ -340,7 +329,6 @@ app.post("/api/outlook-auth", (req, res) => {
 
 /* ================================
    TIDIO CONFIG
-   GET /api/tidio-config
 ================================ */
 app.get("/api/tidio-config", (req, res) => {
   try {
@@ -348,10 +336,7 @@ app.get("/api/tidio-config", (req, res) => {
 
     const projectId = process.env.TIDIO_PROJECT_ID;
     if (!projectId) {
-      return res.status(500).json({
-        ok: false,
-        error: "Missing TIDIO_PROJECT_ID",
-      });
+      return res.status(500).json({ ok: false, error: "Missing TIDIO_PROJECT_ID" });
     }
 
     res.json({ ok: true, projectId });
@@ -366,10 +351,7 @@ app.get("/api/tidio-config", (req, res) => {
 ================================ */
 app.use((err, req, res, next) => {
   console.error("[Error]", err);
-  res.status(500).json({
-    ok: false,
-    error: "Internal server error",
-  });
+  res.status(500).json({ ok: false, error: "Internal server error" });
 });
 
 /* ================================
@@ -378,6 +360,6 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`✅ Backend running on port ${PORT}`);
   console.log(`📍 URL: ${baseUrl}`);
-  console.log(`📅 Monday tickets: ${baseUrl}/api/monday/tickets`);
   console.log(`📞 TwiML Voice URL: ${baseUrl}/api/voice`);
+  console.log(`📅 Monday Tickets URL: ${baseUrl}/api/monday/tickets?groupId=topics`);
 });
