@@ -2,8 +2,8 @@
  * AFI OPS Backend (Render / Local)
  * - Twilio Voice Token (JWT moderne)
  * - TwiML Voice endpoint
- * - Monday tickets proxy normalisé (cache TTL, complexité réduite)
- * - Monday create ticket (Paperform/Zapier → group "topics")
+ * - Monday tickets proxy normalisé (avec cache TTL)
+ * - Monday Create Item (group "topics") ready
  */
 
 const express = require("express");
@@ -28,6 +28,7 @@ console.log("ENV vars loaded:", {
   TWILIO_PHONE_NUMBER: process.env.TWILIO_PHONE_NUMBER ? "✓" : "✗",
   MONDAY_TOKEN: process.env.MONDAY_TOKEN ? "✓" : "✗",
   MONDAY_BOARD_ID: process.env.MONDAY_BOARD_ID ? "✓" : "⚠️ fallback",
+  MONDAY_GROUP_ID: process.env.MONDAY_GROUP_ID ? "✓" : "⚠️ fallback topics",
   RENDER_EXTERNAL_URL: process.env.RENDER_EXTERNAL_URL ? "✓" : "⚠️ local",
 });
 
@@ -76,8 +77,8 @@ app.post("/api/twilio-token", (req, res) => {
 
     const token = new AccessToken(
       TWILIO_ACCOUNT_SID,
-      TWILIO_API_KEY, // SK...
-      TWILIO_API_SECRET, // secret SK
+      TWILIO_API_KEY, // doit être SK...
+      TWILIO_API_SECRET, // secret de la SK
       { identity }
     );
 
@@ -133,7 +134,7 @@ app.post("/api/voice", (req, res) => {
       }
     } else {
       response.say("Merci d'appeler AFI OPS. Aucun destinataire spécifié.");
-      console.log("[Voice] ⚠️  No destination provided");
+      console.log("[Voice] ⚠️ No destination provided");
     }
 
     res.type("text/xml");
@@ -147,10 +148,8 @@ app.post("/api/voice", (req, res) => {
 /* ================================
    MONDAY TICKETS + CACHE TTL
    GET /api/monday/tickets
-   Retourne { items: [...] }
-
-   NOTE:
-   - query light (items_page direct) pour éviter max complexity
+   ✅ Retourne { items: [...] }
+   ✅ FILTRE SUR GROUP "topics"
 ================================ */
 
 // Cache mémoire simple
@@ -158,8 +157,8 @@ const mondayCache = {
   data: null,
   expiresAt: 0,
 };
-const MONDAY_TTL_MS = Number(process.env.MONDAY_TTL_MS || 25000); // 25s
-const MONDAY_ITEMS_LIMIT = Number(process.env.MONDAY_ITEMS_LIMIT || 50); // safe
+const MONDAY_TTL_MS = Number(process.env.MONDAY_TTL_MS || 25000); // 25s par défaut
+const MONDAY_ITEMS_LIMIT = Number(process.env.MONDAY_ITEMS_LIMIT || 50);
 
 app.get("/api/monday/tickets", async (req, res) => {
   console.log("[API] 📅 Fetching tickets from Monday (Proxy)...");
@@ -178,19 +177,21 @@ app.get("/api/monday/tickets", async (req, res) => {
     return res.json(mondayCache.data);
   }
 
-  // Board SAV par défaut (fallback)
-  const boardId = Number(process.env.MONDAY_BOARD_ID || 1763228524);
+  const boardId = process.env.MONDAY_BOARD_ID || 1763228524;
+  const groupId = process.env.MONDAY_GROUP_ID || "topics";
 
   const query = `
-    query ($boardId: ID!, $limit: Int!) {
+    query ($boardId: ID!, $limit: Int!, $groups: [String!]) {
       boards(ids: [$boardId]) {
         id
         name
-        items_page(limit: $limit) {
+        items_page(
+          limit: $limit,
+          query_params: { groups: $groups }
+        ) {
           items {
             id
             name
-            created_at
             updated_at
             group { id title }
             column_values {
@@ -208,7 +209,14 @@ app.get("/api/monday/tickets", async (req, res) => {
   try {
     const response = await axios.post(
       "https://api.monday.com/v2",
-      { query, variables: { boardId, limit: MONDAY_ITEMS_LIMIT } },
+      {
+        query,
+        variables: {
+          boardId,
+          limit: MONDAY_ITEMS_LIMIT,
+          groups: [groupId],
+        },
+      },
       {
         headers: {
           "Content-Type": "application/json",
@@ -234,6 +242,7 @@ app.get("/api/monday/tickets", async (req, res) => {
     }
 
     const rawItems = board.items_page?.items || [];
+
     const items = rawItems.map((item) => {
       const cols = item.column_values || [];
       const colMap = {};
@@ -249,20 +258,20 @@ app.get("/api/monday/tickets", async (req, res) => {
       return {
         id: item.id,
         name: item.name,
-        created_at: item.created_at,
         updated_at: item.updated_at,
-        group: item.group || null, // 👈 pour debug front
+        group: item.group || null, // important pour debug UI
         column_values: colMap,
       };
     });
 
     const payload = { items };
 
+    // Store cache
     mondayCache.data = payload;
     mondayCache.expiresAt = now + MONDAY_TTL_MS;
 
     console.log(
-      `[API] ✅ Tickets normalized: ${items.length} items (cache TTL ${MONDAY_TTL_MS}ms)`
+      `[API] ✅ Tickets normalized: ${items.length} items from group "${groupId}" (cache TTL ${MONDAY_TTL_MS}ms)`
     );
     res.json(payload);
   } catch (error) {
@@ -272,94 +281,75 @@ app.get("/api/monday/tickets", async (req, res) => {
 });
 
 /* ================================
-   MONDAY CREATE TICKET
+   MONDAY CREATE ITEM
    POST /api/monday/create-ticket
-   Body attendu:
-   {
-     full_name, phone, email, address,
-     issue_description, intent, language
-   }
-
-   Board: 1763228524
-   Group (topics): "topics"
+   Body: { full_name, phone, email, address, issue_description, intent, language }
+   ✅ crée dans group "topics"
 ================================ */
+
+function mapIntent(intentRaw = "") {
+  const v = String(intentRaw).toLowerCase().trim();
+  if (v === "service") return "🔧 Service";
+  if (v === "warranty") return "🛡️ Garantie";
+  if (v === "parts") return "🔩 Pièce";
+  if (v === "quote") return "💰 Soumission";
+  return "🔧 Service"; // fallback safe
+}
+
+function mapLanguage(langRaw = "") {
+  const v = String(langRaw).toLowerCase().trim();
+  if (v === "fr") return "🃏 Français";
+  if (v === "en") return "🇬🇧 English";
+  return "🃏 Français";
+}
+
 app.post("/api/monday/create-ticket", async (req, res) => {
-  console.log("[API] 📝 Creating Monday ticket...");
-
-  const {
-    full_name,
-    phone,
-    email,
-    address,
-    issue_description,
-    intent,
-    language,
-  } = req.body || {};
-
-  if (!full_name || !intent) {
-    return res.status(400).json({
-      error: "Missing required fields: full_name, intent",
-    });
-  }
+  console.log("[API] 🆕 Creating Monday item (topics)...");
 
   if (!process.env.MONDAY_TOKEN) {
-    return res.status(500).json({
-      error: "Server misconfigured (missing MONDAY_TOKEN)",
-    });
+    return res
+      .status(500)
+      .json({ error: "Server misconfigured (missing MONDAY_TOKEN)" });
   }
 
-  const BOARD_ID = 1763228524;
-  const GROUP_ID = "topics"; // ✅ topics (Nouvelles demandes)
+  const boardId = process.env.MONDAY_BOARD_ID || 1763228524;
+  const groupId = process.env.MONDAY_GROUP_ID || "topics";
 
-  const mapIntent = (v) => {
-    const key = String(v || "").toLowerCase().trim();
-    const table = {
-      service: "🔧 Service",
-      warranty: "🛡️ Garantie",
-      parts: "🔩 Pièce",
-      quote: "💰 Soumission",
-    };
-    return table[key] || "🔧 Service";
-  };
-
-  const mapLanguage = (v) => {
-    const key = String(v || "").toLowerCase().trim();
-    const table = {
-      fr: "🃏 Français",
-      en: "🇬🇧 English",
-    };
-    return table[key] || "🃏 Français";
-  };
+  const {
+    full_name = "",
+    phone = "",
+    email = "",
+    address = "",
+    issue_description = "",
+    intent = "service",
+    language = "fr",
+  } = req.body || {};
 
   const mapped_intent = mapIntent(intent);
   const mapped_language = mapLanguage(language);
 
-  const item_name = `Ticket AFI – ${full_name} – ${intent}`;
-
-  // date courante YYYY-MM-DD
-  const today = new Date().toISOString().slice(0, 10);
+  const itemName = `Ticket AFI – ${full_name || "Client"} – ${intent || "service"}`;
 
   const column_values = {
     text_mkx51q5v: full_name,
-    phone_mkx5xy3x: phone || "",
-    email_mkx53410: email || "",
-    text_mkx528gx: address || "",
-    long_text_mkx59qsr: issue_description || "",
+    phone_mkx5xy3x: phone,
+    email_mkx53410: email,
+    text_mkx528gx: address,
+    long_text_mkx59qsr: issue_description,
     status: mapped_intent,
     color_mkx5e9jt: mapped_language,
-    date_mkx5asat: { date: today },
+    date_mkx5asat: new Date().toISOString().slice(0, 10), // YYYY-MM-DD
   };
 
-  const query = `
-    mutation ($boardId: ID!, $groupId: String!, $itemName: String!, $columnValues: JSON!) {
+  const mutation = `
+    mutation ($boardId: ID!, $groupId: String!, $itemName: String!, $columnVals: JSON!) {
       create_item (
         board_id: $boardId,
         group_id: $groupId,
         item_name: $itemName,
-        column_values: $columnValues
+        column_values: $columnVals
       ) {
         id
-        name
       }
     }
   `;
@@ -368,12 +358,12 @@ app.post("/api/monday/create-ticket", async (req, res) => {
     const response = await axios.post(
       "https://api.monday.com/v2",
       {
-        query,
+        query: mutation,
         variables: {
-          boardId: BOARD_ID,
-          groupId: GROUP_ID,
-          itemName: item_name,
-          columnValues: JSON.stringify(column_values),
+          boardId,
+          groupId,
+          itemName,
+          columnVals: JSON.stringify(column_values),
         },
       },
       {
@@ -387,24 +377,20 @@ app.post("/api/monday/create-ticket", async (req, res) => {
     );
 
     if (response.data.errors) {
-      console.error("[API] ❌ Monday errors:", response.data.errors);
+      console.error("[API] ❌ Monday create errors:", response.data.errors);
       return res.status(400).json({ errors: response.data.errors });
     }
 
-    const created = response.data.data.create_item;
-    console.log("[API] ✅ Ticket created:", created.id);
+    const newId = response.data?.data?.create_item?.id;
+    console.log("[API] ✅ Monday item created:", newId);
 
-    // Invalide cache pour voir le nouveau ticket rapidement
+    // Invalidate cache so UI sees it fast
     mondayCache.data = null;
     mondayCache.expiresAt = 0;
 
-    res.json({
-      ok: true,
-      item: created,
-      payload_sent: { item_name, column_values },
-    });
-  } catch (e) {
-    console.error("[API] ❌ Create ticket error:", e.message);
+    res.json({ ok: true, id: newId });
+  } catch (error) {
+    console.error("[API] ❌ Create item error:", error.message);
     res.status(500).json({ error: "Failed to create Monday ticket" });
   }
 });
@@ -418,7 +404,8 @@ app.post("/api/outlook-auth", (req, res) => {
 
     const clientId = process.env.OUTLOOK_CLIENT_ID;
     const tenantId = process.env.OUTLOOK_TENANT_ID;
-    const redirectUri = process.env.OUTLOOK_REDIRECT_URI || "https://codepen.io";
+    const redirectUri =
+      process.env.OUTLOOK_REDIRECT_URI || "https://codepen.io";
 
     if (!clientId || !tenantId) {
       return res.status(500).json({
@@ -472,4 +459,10 @@ app.listen(PORT, () => {
   console.log(`✅ Backend running on port ${PORT}`);
   console.log(`📍 URL: ${baseUrl}`);
   console.log(`📞 TwiML Voice URL: ${baseUrl}/api/voice`);
+  console.log(
+    `📅 Monday tickets URL: ${baseUrl}/api/monday/tickets (group topics)`
+  );
+  console.log(
+    `🆕 Monday create URL: ${baseUrl}/api/monday/create-ticket`
+  );
 });
