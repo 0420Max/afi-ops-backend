@@ -10,7 +10,7 @@
  * ✅ Monday Upsert Ticket (front -> Monday)
  * ✅ Monday Resolve Ticket (front -> Monday)
  * ✅ Transcript endpoints (POC safe, return 501 if not wired)
- * ✅ YouTube Search proxy (widget)
+ * ✅ YouTube Search proxy (widget) + aliases
  * ✅ Outlook OAuth URL helper + callback + status (POC in-memory)
  * ✅ Tidio config helper
  *
@@ -483,8 +483,6 @@ app.post("/api/monday/create-ticket", async (req, res) => {
 /* ============================================================
    5.1) MONDAY UPSERT TICKET (front -> Monday)
    POST /api/monday/upsert-ticket
-   Body: { ticket, ticketId, source }
-   NOTE: POC. Ajuste colMap si besoin.
 ============================================================ */
 app.post("/api/monday/upsert-ticket", async (req, res) => {
   console.log("[API] ♻️ Upserting Monday ticket...");
@@ -495,7 +493,6 @@ app.post("/api/monday/upsert-ticket", async (req, res) => {
       return res.status(400).json({ error: "ticketId missing" });
     }
 
-    // Ici on fait simple: update_item sur long_text + statut
     const itemId = String(ticket?.mondayItemId || ticketId || ticket?.id);
 
     const colVals = {
@@ -543,7 +540,6 @@ app.post("/api/monday/upsert-ticket", async (req, res) => {
 /* ============================================================
    5.2) MONDAY RESOLVE TICKET (front -> Monday)
    POST /api/monday/resolve-ticket
-   Body: { ticketId, mondayItemId }
 ============================================================ */
 app.post("/api/monday/resolve-ticket", async (req, res) => {
   console.log("[API] ✅ Resolving Monday ticket...");
@@ -555,7 +551,6 @@ app.post("/api/monday/resolve-ticket", async (req, res) => {
       return res.status(400).json({ error: "ticketId missing" });
     }
 
-    // Change un status colonne "status" si tu veux autre chose
     const colVals = { status: "✅ Résolu" };
 
     const mutation = `
@@ -594,9 +589,6 @@ app.post("/api/monday/resolve-ticket", async (req, res) => {
 
 /* ============================================================
    6) TRANSCRIPT ENDPOINTS (POC SAFE)
-   GET /api/transcript/active
-   GET /api/transcript/by-sid?sid=...
-   -> Retourne 501 tant que STT/Twilio Webhook pas branché
 ============================================================ */
 app.get("/api/transcript/active", (req, res) => {
   return res.status(501).json({
@@ -618,7 +610,6 @@ app.get("/api/transcript/by-sid", (req, res) => {
 
 /* ============================================================
    7) OUTLOOK AUTH URL
-   POST /api/outlook-auth
 ============================================================ */
 app.post("/api/outlook-auth", (req, res) => {
   try {
@@ -647,9 +638,7 @@ app.post("/api/outlook-auth", (req, res) => {
   }
 });
 
-// ============================================================
 // 7.1) OUTLOOK CALLBACK
-// ============================================================
 app.get("/api/outlook/callback", async (req, res) => {
   try {
     const { code, error, error_description } = req.query;
@@ -714,9 +703,7 @@ app.get("/api/outlook/callback", async (req, res) => {
   }
 });
 
-// ============================================================
 // 7.2) OUTLOOK STATUS
-// ============================================================
 app.get("/api/outlook-status", (req, res) => {
   const tokens = outlookTokens.default;
   if (!tokens) return res.json({ connected: false });
@@ -735,7 +722,6 @@ app.get("/api/outlook-status", (req, res) => {
 
 /* ============================================================
    8) TIDIO CONFIG
-   GET /api/tidio-config
 ============================================================ */
 app.get("/api/tidio-config", (req, res) => {
   try {
@@ -753,12 +739,14 @@ app.get("/api/tidio-config", (req, res) => {
 
 /* ============================================================
    9) YOUTUBE SEARCH (widget)
-   GET /api/youtube/search?q=...
+   OFFICIAL:  GET /api/youtube/search?q=...
+   ALIASES:   GET /api/youtube-search?q=...
+              GET /api/youtube-search (front legacy)
 ============================================================ */
 const YT_CACHE_TTL_MS = 60_000;
 const ytCache = new Map();
 
-app.get("/api/youtube/search", async (req, res) => {
+async function handleYoutubeSearch(req, res) {
   try {
     const q = String(req.query.q || "").trim();
     if (!q) return res.json({ items: [] });
@@ -817,7 +805,13 @@ app.get("/api/youtube/search", async (req, res) => {
       items: [],
     });
   }
-});
+}
+
+// Route officielle
+app.get("/api/youtube/search", handleYoutubeSearch);
+
+// Alias legacy demandé par ton front actuel
+app.get("/api/youtube-search", handleYoutubeSearch);
 
 /* ============================================================
    10) ERROR HANDLING
