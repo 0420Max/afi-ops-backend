@@ -10,7 +10,7 @@
  * ✅ Monday Upsert Ticket (front -> Monday)
  * ✅ Monday Resolve Ticket (front -> Monday)
  * ✅ Transcript endpoints (POC safe, return 501 if not wired)
- * ✅ YouTube Search proxy (widget) + aliases
+ * ✅ YouTube Search proxy (widget)
  * ✅ Outlook OAuth URL helper + callback + status (POC in-memory)
  * ✅ Tidio config helper
  *
@@ -483,6 +483,8 @@ app.post("/api/monday/create-ticket", async (req, res) => {
 /* ============================================================
    5.1) MONDAY UPSERT TICKET (front -> Monday)
    POST /api/monday/upsert-ticket
+   Body: { ticket, ticketId, source }
+   NOTE: POC. Ajuste colMap si besoin.
 ============================================================ */
 app.post("/api/monday/upsert-ticket", async (req, res) => {
   console.log("[API] ♻️ Upserting Monday ticket...");
@@ -540,6 +542,7 @@ app.post("/api/monday/upsert-ticket", async (req, res) => {
 /* ============================================================
    5.2) MONDAY RESOLVE TICKET (front -> Monday)
    POST /api/monday/resolve-ticket
+   Body: { ticketId, mondayItemId }
 ============================================================ */
 app.post("/api/monday/resolve-ticket", async (req, res) => {
   console.log("[API] ✅ Resolving Monday ticket...");
@@ -638,7 +641,6 @@ app.post("/api/outlook-auth", (req, res) => {
   }
 });
 
-// 7.1) OUTLOOK CALLBACK
 app.get("/api/outlook/callback", async (req, res) => {
   try {
     const { code, error, error_description } = req.query;
@@ -703,7 +705,6 @@ app.get("/api/outlook/callback", async (req, res) => {
   }
 });
 
-// 7.2) OUTLOOK STATUS
 app.get("/api/outlook-status", (req, res) => {
   const tokens = outlookTokens.default;
   if (!tokens) return res.json({ connected: false });
@@ -739,9 +740,9 @@ app.get("/api/tidio-config", (req, res) => {
 
 /* ============================================================
    9) YOUTUBE SEARCH (widget)
-   OFFICIAL:  GET /api/youtube/search?q=...
-   ALIASES:   GET /api/youtube-search?q=...
-              GET /api/youtube-search (front legacy)
+   ✅ Routes:
+   - GET /api/youtube/search?q=...
+   - GET /api/youtube-search?q=... (alias compat front)
 ============================================================ */
 const YT_CACHE_TTL_MS = 60_000;
 const ytCache = new Map();
@@ -807,10 +808,8 @@ async function handleYoutubeSearch(req, res) {
   }
 }
 
-// Route officielle
+// Primary + alias legacy
 app.get("/api/youtube/search", handleYoutubeSearch);
-
-// Alias legacy demandé par ton front actuel
 app.get("/api/youtube-search", handleYoutubeSearch);
 
 /* ============================================================
