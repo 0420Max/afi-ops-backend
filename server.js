@@ -7,7 +7,7 @@
  * ✅ TwiML Voice endpoint (outgoing + incoming)
  * ✅ Monday tickets proxy normalisé + cache TTL
  * ✅ Monday Create Ticket (group topics) selon mapping Paperform
- * ✅ Outlook OAuth URL helper (placeholder)
+ * ✅ Outlook OAuth URL helper (placeholder + callback + status)
  * ✅ Tidio config helper
  *
  * IMPORTANT:
@@ -47,6 +47,7 @@ const {
   MONDAY_API_VERSION: MONDAY_API_VERSION_ENV,
   OUTLOOK_CLIENT_ID,
   OUTLOOK_TENANT_ID,
+  OUTLOOK_CLIENT_SECRET,
   OUTLOOK_REDIRECT_URI,
   TIDIO_PROJECT_ID,
   TWILIO_TOKEN_TTL,
@@ -55,8 +56,7 @@ const {
 const MONDAY_TTL_MS = Number(MONDAY_TTL_MS_ENV || 25000);
 const MONDAY_ITEMS_LIMIT = Number(MONDAY_ITEMS_LIMIT_ENV || 50);
 const DEFAULT_BOARD_ID = Number(MONDAY_BOARD_ID || 1763228524);
-const DEFAULT_GROUP_ID =
-  process.env.MONDAY_GROUP_ID || "topics";
+const DEFAULT_GROUP_ID = process.env.MONDAY_GROUP_ID || "topics";
 const MONDAY_API_VERSION = MONDAY_API_VERSION_ENV || "2023-10";
 
 // Twilio toggle: on démarre le serveur même si Twilio est mal configuré,
@@ -66,6 +66,15 @@ const TWILIO_ENABLED =
   !!TWILIO_API_KEY &&
   !!TWILIO_API_SECRET &&
   !!TWILIO_TWIML_APP_SID;
+
+/* ============================================================
+   OUTLOOK TOKEN STORE (in-memory POC)
+   - un seul agent
+   - 90% solution dev, prêt pour upgrade DB/Redis plus tard
+============================================================ */
+const outlookTokens = {
+  default: null,
+};
 
 /* ============================================================
    LOG ENV CHECK
@@ -84,10 +93,18 @@ console.log("ENV vars loaded:", {
     ? `✓ (${MONDAY_ITEMS_LIMIT_ENV})`
     : "default 50",
   RENDER_EXTERNAL_URL: RENDER_EXTERNAL_URL ? "✓" : "⚠️ local",
+
+  // Outlook (facultatif mais pratique)
   OUTLOOK_CLIENT_ID: OUTLOOK_CLIENT_ID ? "✓" : "✗",
   OUTLOOK_TENANT_ID: OUTLOOK_TENANT_ID ? "✓" : "✗",
+  OUTLOOK_CLIENT_SECRET: OUTLOOK_CLIENT_SECRET ? "✓" : "✗",
+  OUTLOOK_REDIRECT_URI:
+    OUTLOOK_REDIRECT_URI || "⚠️ default /api/outlook/callback",
+
   TIDIO_PROJECT_ID: TIDIO_PROJECT_ID ? "✓" : "✗",
-  TWILIO_TOKEN_TTL: TWILIO_TOKEN_TTL ? `✓ (${TWILIO_TOKEN_TTL}s)` : "default 3600s",
+  TWILIO_TOKEN_TTL: TWILIO_TOKEN_TTL
+    ? `✓ (${TWILIO_TOKEN_TTL}s)`
+    : "default 3600s",
 });
 
 // Log Twilio readiness (diagnostic doux)
@@ -109,7 +126,11 @@ app.get("/", (req, res) => {
       twilio: TWILIO_ENABLED ? "ready" : "disabled",
       monday: !!MONDAY_TOKEN ? "ready" : "missing_token",
       outlook:
-        OUTLOOK_CLIENT_ID && OUTLOOK_TENANT_ID ? "partial" : "not_configured",
+        OUTLOOK_CLIENT_ID && OUTLOOK_TENANT_ID
+          ? outlookTokens.default
+            ? "connected"
+            : "configured_not_connected"
+          : "not_configured",
       tidio: !!TIDIO_PROJECT_ID ? "ready" : "not_configured",
     },
   });
@@ -530,7 +551,7 @@ app.post("/api/monday/create-ticket", async (req, res) => {
 });
 
 /* ============================================================
-   6) OUTLOOK TOKEN (OAuth) - placeholder
+   6) OUTLOOK TOKEN (OAuth) - helper URL
    POST /api/outlook-auth
 ============================================================ */
 app.post("/api/outlook-auth", (req, res) => {
@@ -540,7 +561,8 @@ app.post("/api/outlook-auth", (req, res) => {
     const clientId = OUTLOOK_CLIENT_ID;
     const tenantId = OUTLOOK_TENANT_ID;
     const redirectUri =
-      OUTLOOK_REDIRECT_URI || "https://codepen.io";
+      OUTLOOK_REDIRECT_URI ||
+      `${baseUrl.replace(/\/$/, "")}/api/outlook/callback`;
 
     if (!clientId || !tenantId) {
       return res.status(500).json({
@@ -559,6 +581,105 @@ app.post("/api/outlook-auth", (req, res) => {
     console.error("[Outlook] ❌ Error:", e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ============================================================
+// 6.1) OUTLOOK CALLBACK  (Azure -> Backend)
+// GET /api/outlook/callback?code=...&state=...
+// ============================================================
+app.get("/api/outlook/callback", async (req, res) => {
+  try {
+    const { code, error, error_description } = req.query;
+
+    if (error) {
+      console.error("[Outlook] Auth error:", error, error_description);
+      return res
+        .status(400)
+        .send(
+          `<h1>Outlook - Erreur</h1><p>${error_description || error}</p>`
+        );
+    }
+
+    if (!code) {
+      return res.status(400).send("<h1>Outlook - Code manquant</h1>");
+    }
+
+    if (!OUTLOOK_CLIENT_ID || !OUTLOOK_CLIENT_SECRET || !OUTLOOK_TENANT_ID) {
+      console.error("[Outlook] Config incomplète côté backend.");
+      return res
+        .status(500)
+        .send("<h1>Outlook non configuré côté backend.</h1>");
+    }
+
+    const tokenUrl = `https://login.microsoftonline.com/${OUTLOOK_TENANT_ID}/oauth2/v2.0/token`;
+
+    const params = new URLSearchParams({
+      client_id: OUTLOOK_CLIENT_ID,
+      client_secret: OUTLOOK_CLIENT_SECRET,
+      grant_type: "authorization_code",
+      code,
+      redirect_uri:
+        OUTLOOK_REDIRECT_URI ||
+        `${baseUrl.replace(/\/$/, "")}/api/outlook/callback`,
+    });
+
+    const tokenRes = await axios.post(tokenUrl, params.toString(), {
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      timeout: 15000,
+    });
+
+    outlookTokens.default = {
+      ...tokenRes.data,
+      obtained_at: Date.now(),
+    };
+
+    console.log("[Outlook] ✅ Tokens reçus (access + refresh).");
+
+    // Mini page de succès + message au front
+    res.send(`
+      <html>
+        <body style="background:#020617;color:#e5e7eb;font-family:-apple-system,system-ui;padding:32px">
+          <h1>Outlook connecté ✅</h1>
+          <p>Tu peux fermer cette fenêtre et revenir à AFI OPS Cockpit.</p>
+          <script>
+            if (window.opener) {
+              window.opener.postMessage({ type: "OUTLOOK_CONNECTED" }, "*");
+            }
+          </script>
+        </body>
+      </html>
+    `);
+  } catch (e) {
+    console.error("[Outlook] Callback error:", e.message);
+    res
+      .status(500)
+      .send("<h1>Erreur lors de la récupération du token Outlook.</h1>");
+  }
+});
+
+// ============================================================
+// 6.2) OUTLOOK STATUS
+// GET /api/outlook-status  -> { connected: bool, expiresInSeconds? }
+// ============================================================
+app.get("/api/outlook-status", (req, res) => {
+  const tokens = outlookTokens.default;
+  if (!tokens) {
+    return res.json({ connected: false });
+  }
+
+  const expiresIn = tokens.expires_in
+    ? Math.max(
+        0,
+        Math.floor(
+          (tokens.obtained_at + tokens.expires_in * 1000 - Date.now()) / 1000
+        )
+      )
+    : null;
+
+  res.json({
+    connected: true,
+    expiresInSeconds: expiresIn,
+  });
 });
 
 /* ============================================================
@@ -600,4 +721,5 @@ app.listen(PORT, () => {
   console.log(`✅ Backend running on port ${PORT}`);
   console.log(`📍 URL: ${baseUrl}`);
   console.log(`📞 TwiML Voice URL: ${baseUrl}/api/voice`);
+  console.log(`📧 Outlook callback URL: ${baseUrl}/api/outlook/callback`);
 });
