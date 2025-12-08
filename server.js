@@ -62,7 +62,9 @@ const {
 
 const MONDAY_TTL_MS = Number(MONDAY_TTL_MS_ENV || 25000);
 const MONDAY_ITEMS_LIMIT = Number(MONDAY_ITEMS_LIMIT_ENV || 50);
-const DEFAULT_BOARD_ID = Number(MONDAY_BOARD_ID || 1763228524);
+
+// ✅ FIX 1: board v3 par défaut (Services v3)
+const DEFAULT_BOARD_ID = Number(MONDAY_BOARD_ID || 18290169368);
 const DEFAULT_GROUP_ID = String(MONDAY_GROUP_ID || "topics");
 const MONDAY_API_VERSION = MONDAY_API_VERSION_ENV || "2023-10";
 
@@ -92,7 +94,7 @@ console.log("ENV vars loaded:", {
   TWILIO_PHONE_NUMBER: TWILIO_PHONE_NUMBER ? "✓" : "✗",
 
   MONDAY_TOKEN: MONDAY_TOKEN ? "✓" : "✗",
-  MONDAY_BOARD_ID: MONDAY_BOARD_ID ? "✓" : "⚠️ fallback",
+  MONDAY_BOARD_ID: MONDAY_BOARD_ID ? "✓" : `⚠️ fallback=${DEFAULT_BOARD_ID}`,
   MONDAY_GROUP_ID: MONDAY_GROUP_ID ? `✓ (${MONDAY_GROUP_ID})` : "default topics",
   MONDAY_TTL_MS: MONDAY_TTL_MS_ENV ? `✓ (${MONDAY_TTL_MS_ENV})` : "default 25s",
   MONDAY_ITEMS_LIMIT: MONDAY_ITEMS_LIMIT_ENV
@@ -140,6 +142,10 @@ app.get("/", (req, res) => {
       tidio: !!TIDIO_PROJECT_ID ? "ready" : "not_configured",
       youtube: !!YOUTUBE_API_KEY ? "ready" : "missing_key",
       transcript: "poc_safe",
+    },
+    mondayDefaults: {
+      boardId: DEFAULT_BOARD_ID,
+      groupId: DEFAULT_GROUP_ID,
     },
   });
 });
@@ -303,6 +309,8 @@ app.get("/api/monday/tickets", async (req, res) => {
   const now = Date.now();
   const boardId = Number(req.query.boardId || DEFAULT_BOARD_ID);
   const groupId = String(req.query.groupId || DEFAULT_GROUP_ID);
+
+  console.log(`[Monday] boardId=${boardId} groupId=${groupId}`);
 
   if (
     mondayCache.data &&
@@ -483,19 +491,20 @@ app.post("/api/monday/create-ticket", async (req, res) => {
 /* ============================================================
    5.1) MONDAY UPSERT TICKET (front -> Monday)
    POST /api/monday/upsert-ticket
-   Body: { ticket, ticketId, source }
+   Body: { ticket, ticketId, source, boardId }
    NOTE: POC. Ajuste colMap si besoin.
 ============================================================ */
 app.post("/api/monday/upsert-ticket", async (req, res) => {
   console.log("[API] ♻️ Upserting Monday ticket...");
 
   try {
-    const { ticket, ticketId } = req.body || {};
+    const { ticket, ticketId, boardId: bodyBoardId } = req.body || {};
     if (!ticketId && !ticket?.id) {
       return res.status(400).json({ error: "ticketId missing" });
     }
 
     const itemId = String(ticket?.mondayItemId || ticketId || ticket?.id);
+    const boardId = Number(bodyBoardId || ticket?.boardId || DEFAULT_BOARD_ID);
 
     const colVals = {
       long_text_mkx59qsr:
@@ -505,11 +514,12 @@ app.post("/api/monday/upsert-ticket", async (req, res) => {
         "",
     };
 
+    // ✅ FIX 2: board_id runtime, pas DEFAULT hardcodé
     const mutation = `
-      mutation ($itemId: ID!, $cols: JSON!) {
+      mutation ($itemId: ID!, $cols: JSON!, $boardId: ID!) {
         change_multiple_column_values(
           item_id: $itemId,
-          board_id: ${DEFAULT_BOARD_ID},
+          board_id: $boardId,
           column_values: $cols
         ) { id }
       }
@@ -517,6 +527,7 @@ app.post("/api/monday/upsert-ticket", async (req, res) => {
 
     const data = await mondayRequest(mutation, {
       itemId,
+      boardId,
       cols: JSON.stringify(colVals),
     });
 
@@ -527,6 +538,7 @@ app.post("/api/monday/upsert-ticket", async (req, res) => {
     res.json({
       ok: true,
       itemId,
+      boardId,
       status: "updated",
     });
   } catch (e) {
@@ -542,25 +554,27 @@ app.post("/api/monday/upsert-ticket", async (req, res) => {
 /* ============================================================
    5.2) MONDAY RESOLVE TICKET (front -> Monday)
    POST /api/monday/resolve-ticket
-   Body: { ticketId, mondayItemId }
+   Body: { ticketId, mondayItemId, boardId }
 ============================================================ */
 app.post("/api/monday/resolve-ticket", async (req, res) => {
   console.log("[API] ✅ Resolving Monday ticket...");
 
   try {
-    const { ticketId, mondayItemId } = req.body || {};
+    const { ticketId, mondayItemId, boardId: bodyBoardId } = req.body || {};
     const itemId = String(mondayItemId || ticketId);
     if (!itemId) {
       return res.status(400).json({ error: "ticketId missing" });
     }
 
+    const boardId = Number(bodyBoardId || DEFAULT_BOARD_ID);
     const colVals = { status: "✅ Résolu" };
 
+    // ✅ FIX 2: board_id runtime ici aussi
     const mutation = `
-      mutation ($itemId: ID!, $cols: JSON!) {
+      mutation ($itemId: ID!, $cols: JSON!, $boardId: ID!) {
         change_multiple_column_values(
           item_id: $itemId,
-          board_id: ${DEFAULT_BOARD_ID},
+          board_id: $boardId,
           column_values: $cols
         ) { id }
       }
@@ -568,6 +582,7 @@ app.post("/api/monday/resolve-ticket", async (req, res) => {
 
     const data = await mondayRequest(mutation, {
       itemId,
+      boardId,
       cols: JSON.stringify(colVals),
     });
 
@@ -578,6 +593,7 @@ app.post("/api/monday/resolve-ticket", async (req, res) => {
     res.json({
       ok: true,
       itemId,
+      boardId,
       status: "resolved",
     });
   } catch (e) {
