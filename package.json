@@ -1,6 +1,6 @@
 {
   "name": "afi-ops-backend",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -11,6 +11,7 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
+    "express-session": "^1.18.0",
     "twilio": "^5.6.2"
   }
 }
