@@ -9,6 +9,7 @@
  * ✅ Monday Create Ticket (Paperform -> topics)
  * ✅ Monday Upsert Ticket (front -> Monday)
  * ✅ Monday Resolve Ticket (front -> Monday)
+ * ✅ Ticket lookup by AFI-ID or Hash
  * ✅ Transcript endpoints (POC safe, return 501 if not wired)
  * ✅ YouTube Search proxy (widget)
  * ✅ Outlook OAuth URL helper + callback + status (POC in-memory)
@@ -17,6 +18,7 @@
  * IMPORTANT:
  * - Monday API: items_page au niveau du board
  * - group_ids ne marche pas dans items_page -> filtre backend
+ * - AFI Ticket ID est dérivé du monday item.id (Approche B)
  */
 
 const express = require("express");
@@ -63,7 +65,7 @@ const {
 const MONDAY_TTL_MS = Number(MONDAY_TTL_MS_ENV || 25000);
 const MONDAY_ITEMS_LIMIT = Number(MONDAY_ITEMS_LIMIT_ENV || 50);
 
-// ✅ FIX 1: board v3 par défaut (Services v3)
+// ✅ Services v3 defaults
 const DEFAULT_BOARD_ID = Number(MONDAY_BOARD_ID || 18290169368);
 const DEFAULT_GROUP_ID = String(MONDAY_GROUP_ID || "topics");
 const MONDAY_API_VERSION = MONDAY_API_VERSION_ENV || "2023-10";
@@ -78,9 +80,16 @@ const TWILIO_ENABLED =
 /* ============================================================
    OUTLOOK TOKEN STORE (in-memory POC)
 ============================================================ */
-const outlookTokens = {
-  default: null,
-};
+const outlookTokens = { default: null };
+
+/* ============================================================
+   UTIL: AFI ID DERIVATION (Approche B)
+============================================================ */
+function toAfiTicketId(mondayItemId) {
+  const n = Number(mondayItemId || 0);
+  const padded = String(n).padStart(4, "0");
+  return `AFI-${padded}`;
+}
 
 /* ============================================================
    LOG ENV CHECK
@@ -94,7 +103,7 @@ console.log("ENV vars loaded:", {
   TWILIO_PHONE_NUMBER: TWILIO_PHONE_NUMBER ? "✓" : "✗",
 
   MONDAY_TOKEN: MONDAY_TOKEN ? "✓" : "✗",
-  MONDAY_BOARD_ID: MONDAY_BOARD_ID ? "✓" : `⚠️ fallback=${DEFAULT_BOARD_ID}`,
+  MONDAY_BOARD_ID: MONDAY_BOARD_ID ? "✓" : "⚠️ fallback Services v3",
   MONDAY_GROUP_ID: MONDAY_GROUP_ID ? `✓ (${MONDAY_GROUP_ID})` : "default topics",
   MONDAY_TTL_MS: MONDAY_TTL_MS_ENV ? `✓ (${MONDAY_TTL_MS_ENV})` : "default 25s",
   MONDAY_ITEMS_LIMIT: MONDAY_ITEMS_LIMIT_ENV
@@ -143,10 +152,6 @@ app.get("/", (req, res) => {
       youtube: !!YOUTUBE_API_KEY ? "ready" : "missing_key",
       transcript: "poc_safe",
     },
-    mondayDefaults: {
-      boardId: DEFAULT_BOARD_ID,
-      groupId: DEFAULT_GROUP_ID,
-    },
   });
 });
 
@@ -175,7 +180,6 @@ app.get("/api/twilio/health", (req, res) => {
 
 /* ============================================================
    1) TWILIO TOKEN (VoIP)
-   POST /api/twilio-token
 ============================================================ */
 app.post("/api/twilio-token", (req, res) => {
   try {
@@ -228,7 +232,6 @@ app.post("/api/twilio-token", (req, res) => {
 
 /* ============================================================
    2) TWIML VOICE
-   POST /api/voice
 ============================================================ */
 app.post("/api/voice", (req, res) => {
   try {
@@ -294,7 +297,6 @@ async function mondayRequest(query, variables) {
 
 /* ============================================================
    4) MONDAY TICKETS PROXY + CACHE TTL
-   GET /api/monday/tickets
 ============================================================ */
 const mondayCache = {
   data: null,
@@ -309,8 +311,6 @@ app.get("/api/monday/tickets", async (req, res) => {
   const now = Date.now();
   const boardId = Number(req.query.boardId || DEFAULT_BOARD_ID);
   const groupId = String(req.query.groupId || DEFAULT_GROUP_ID);
-
-  console.log(`[Monday] boardId=${boardId} groupId=${groupId}`);
 
   if (
     mondayCache.data &&
@@ -361,8 +361,12 @@ app.get("/api/monday/tickets", async (req, res) => {
           value: col.value,
         };
       });
+
+      const afi_ticket_id = toAfiTicketId(item.id);
+
       return {
-        id: item.id,
+        id: item.id,                 // monday item id
+        afi_ticket_id,               // derived AFI-0000
         name: item.name,
         updated_at: item.updated_at,
         group: item.group || null,
@@ -393,8 +397,91 @@ app.get("/api/monday/tickets", async (req, res) => {
 });
 
 /* ============================================================
+   4.1) LOOKUP BY AFI ID OR HASH
+   GET /api/monday/ticket-by-key?afiId=AFI-0058
+   GET /api/monday/ticket-by-key?hash=69123...
+============================================================ */
+app.get("/api/monday/ticket-by-key", async (req, res) => {
+  try {
+    const afiId = String(req.query.afiId || "").trim();
+    const hash = String(req.query.hash || "").trim();
+
+    if (!afiId && !hash) {
+      return res.status(400).json({ error: "afiId or hash required" });
+    }
+
+    const query = `
+      query ($boardId: ID!, $limit: Int!) {
+        boards(ids: [$boardId]) {
+          items_page(limit: $limit) {
+            items {
+              id
+              name
+              updated_at
+              group { id title }
+              column_values { id text type value }
+            }
+          }
+        }
+      }
+    `;
+
+    const data = await mondayRequest(query, {
+      boardId: DEFAULT_BOARD_ID,
+      limit: MONDAY_ITEMS_LIMIT,
+    });
+
+    if (data.errors) return res.status(400).json({ errors: data.errors });
+
+    const rawItems =
+      data?.data?.boards?.[0]?.items_page?.items || [];
+
+    const normalized = rawItems.map((item) => {
+      const cols = item.column_values || [];
+      const colMap = {};
+      cols.forEach((col) => {
+        colMap[col.id] = col;
+      });
+      return {
+        id: item.id,
+        afi_ticket_id: toAfiTicketId(item.id),
+        name: item.name,
+        updated_at: item.updated_at,
+        group: item.group || null,
+        column_values: colMap,
+      };
+    });
+
+    let found = null;
+
+    if (afiId) {
+      found = normalized.find(
+        (it) => it.afi_ticket_id.toLowerCase() === afiId.toLowerCase()
+      );
+    }
+
+    if (!found && hash) {
+      found = normalized.find((it) => {
+        const h = it.column_values?.text_mkx5q1ss?.text || "";
+        return h.includes(hash);
+      });
+    }
+
+    if (!found) return res.status(404).json({ error: "ticket not found" });
+
+    res.json({ ok: true, ticket: found });
+  } catch (e) {
+    console.error("[API] ❌ ticket-by-key failed:", e.message);
+    res.status(500).json({
+      ok: false,
+      error: "ticket-by-key failed",
+      details: e.message,
+    });
+  }
+});
+
+/* ============================================================
    5) MONDAY CREATE TICKET (Paperform -> topics)
-   POST /api/monday/create-ticket
 ============================================================ */
 const INTENT_MAP = {
   service: "🔧 Service",
@@ -422,6 +509,7 @@ app.post("/api/monday/create-ticket", async (req, res) => {
     issue_description,
     intent,
     language,
+    ticket_hash,
     zap_meta_timestamp,
   } = req.body || {};
 
@@ -436,6 +524,7 @@ app.post("/api/monday/create-ticket", async (req, res) => {
   const item_name = `Ticket AFI – ${full_name} – ${intent}`;
 
   const column_values = {
+    // ✅ Services v3 mapping
     text_mkx51q5v: full_name || "",
     phone_mkx5xy3x: phone || "",
     email_mkx53410: email || "",
@@ -445,6 +534,9 @@ app.post("/api/monday/create-ticket", async (req, res) => {
     color_mkx5e9jt: mapped_language,
     date_mkx5asat:
       zap_meta_timestamp || new Date().toISOString().split("T")[0],
+
+    // ✅ Ticket Hash column
+    text_mkx5q1ss: ticket_hash || "",
   };
 
   const mutation = `
@@ -470,9 +562,13 @@ app.post("/api/monday/create-ticket", async (req, res) => {
 
     mondayCache.data = null;
 
+    const created = data?.data?.create_item;
+    const afi_ticket_id = toAfiTicketId(created?.id);
+
     res.json({
       ok: true,
-      item: data?.data?.create_item,
+      item: created,
+      afi_ticket_id,
       item_name,
       column_values,
       boardId,
@@ -490,21 +586,17 @@ app.post("/api/monday/create-ticket", async (req, res) => {
 
 /* ============================================================
    5.1) MONDAY UPSERT TICKET (front -> Monday)
-   POST /api/monday/upsert-ticket
-   Body: { ticket, ticketId, source, boardId }
-   NOTE: POC. Ajuste colMap si besoin.
 ============================================================ */
 app.post("/api/monday/upsert-ticket", async (req, res) => {
   console.log("[API] ♻️ Upserting Monday ticket...");
 
   try {
-    const { ticket, ticketId, boardId: bodyBoardId } = req.body || {};
+    const { ticket, ticketId } = req.body || {};
     if (!ticketId && !ticket?.id) {
       return res.status(400).json({ error: "ticketId missing" });
     }
 
     const itemId = String(ticket?.mondayItemId || ticketId || ticket?.id);
-    const boardId = Number(bodyBoardId || ticket?.boardId || DEFAULT_BOARD_ID);
 
     const colVals = {
       long_text_mkx59qsr:
@@ -514,12 +606,11 @@ app.post("/api/monday/upsert-ticket", async (req, res) => {
         "",
     };
 
-    // ✅ FIX 2: board_id runtime, pas DEFAULT hardcodé
     const mutation = `
-      mutation ($itemId: ID!, $cols: JSON!, $boardId: ID!) {
+      mutation ($itemId: ID!, $cols: JSON!) {
         change_multiple_column_values(
           item_id: $itemId,
-          board_id: $boardId,
+          board_id: ${DEFAULT_BOARD_ID},
           column_values: $cols
         ) { id }
       }
@@ -527,7 +618,6 @@ app.post("/api/monday/upsert-ticket", async (req, res) => {
 
     const data = await mondayRequest(mutation, {
       itemId,
-      boardId,
       cols: JSON.stringify(colVals),
     });
 
@@ -538,7 +628,7 @@ app.post("/api/monday/upsert-ticket", async (req, res) => {
     res.json({
       ok: true,
       itemId,
-      boardId,
+      afi_ticket_id: toAfiTicketId(itemId),
       status: "updated",
     });
   } catch (e) {
@@ -553,28 +643,24 @@ app.post("/api/monday/upsert-ticket", async (req, res) => {
 
 /* ============================================================
    5.2) MONDAY RESOLVE TICKET (front -> Monday)
-   POST /api/monday/resolve-ticket
-   Body: { ticketId, mondayItemId, boardId }
 ============================================================ */
 app.post("/api/monday/resolve-ticket", async (req, res) => {
   console.log("[API] ✅ Resolving Monday ticket...");
 
   try {
-    const { ticketId, mondayItemId, boardId: bodyBoardId } = req.body || {};
+    const { ticketId, mondayItemId } = req.body || {};
     const itemId = String(mondayItemId || ticketId);
     if (!itemId) {
       return res.status(400).json({ error: "ticketId missing" });
     }
 
-    const boardId = Number(bodyBoardId || DEFAULT_BOARD_ID);
-    const colVals = { status: "✅ Résolu" };
+    const colVals = { color_mkx55mz3: "✅ Résolu" }; // Statut
 
-    // ✅ FIX 2: board_id runtime ici aussi
     const mutation = `
-      mutation ($itemId: ID!, $cols: JSON!, $boardId: ID!) {
+      mutation ($itemId: ID!, $cols: JSON!) {
         change_multiple_column_values(
           item_id: $itemId,
-          board_id: $boardId,
+          board_id: ${DEFAULT_BOARD_ID},
           column_values: $cols
         ) { id }
       }
@@ -582,7 +668,6 @@ app.post("/api/monday/resolve-ticket", async (req, res) => {
 
     const data = await mondayRequest(mutation, {
       itemId,
-      boardId,
       cols: JSON.stringify(colVals),
     });
 
@@ -593,7 +678,7 @@ app.post("/api/monday/resolve-ticket", async (req, res) => {
     res.json({
       ok: true,
       itemId,
-      boardId,
+      afi_ticket_id: toAfiTicketId(itemId),
       status: "resolved",
     });
   } catch (e) {
@@ -628,7 +713,7 @@ app.get("/api/transcript/by-sid", (req, res) => {
 });
 
 /* ============================================================
-   7) OUTLOOK AUTH URL
+   7) OUTLOOK AUTH URL + CALLBACK + STATUS
 ============================================================ */
 app.post("/api/outlook-auth", (req, res) => {
   try {
@@ -756,9 +841,6 @@ app.get("/api/tidio-config", (req, res) => {
 
 /* ============================================================
    9) YOUTUBE SEARCH (widget)
-   ✅ Routes:
-   - GET /api/youtube/search?q=...
-   - GET /api/youtube-search?q=... (alias compat front)
 ============================================================ */
 const YT_CACHE_TTL_MS = 60_000;
 const ytCache = new Map();
@@ -824,7 +906,6 @@ async function handleYoutubeSearch(req, res) {
   }
 }
 
-// Primary + alias legacy
 app.get("/api/youtube/search", handleYoutubeSearch);
 app.get("/api/youtube-search", handleYoutubeSearch);
 
