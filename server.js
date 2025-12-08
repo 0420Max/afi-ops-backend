@@ -13,7 +13,7 @@
  * ✅ Transcript endpoints (POC safe, return 501 if not wired)
  * ✅ YouTube Search proxy (widget)
  * ✅ Outlook OAuth URL helper + callback + status (PKCE + session cookie)
- * ✅ Outlook messages fetch via Graph (+ optional filters)
+ * ✅ Outlook emails fetch via Graph (+ optional filters)
  * ✅ Tidio config helper
  *
  * IMPORTANT:
@@ -34,19 +34,17 @@ const app = express();
 
 /* ============================================================
    CORS (FIX credentials + origins explicites)
-   - Required because front uses credentials: "include"
-   - "*" is illegal with credentials
 ============================================================ */
 const allowedOrigins = [
   "https://cdpn.io",
   "https://codepen.io",
-  "https://afi-ops-frontend.onrender.com", // futur front hosted
+  "https://afi-ops-frontend.onrender.com",
   "http://localhost:5173",
   "http://localhost:3000",
 ];
 
 function isAllowedOrigin(origin) {
-  if (!origin) return true; // Postman / server-to-server / same-origin
+  if (!origin) return true; // Postman / server-to-server / no-origin
   if (allowedOrigins.includes(origin)) return true;
 
   // allow CodePen hash subdomains like https://abc123.cdpn.io
@@ -54,9 +52,7 @@ function isAllowedOrigin(origin) {
     const u = new URL(origin);
     const host = u.hostname.toLowerCase();
     if (host.endsWith(".cdpn.io") || host.endsWith(".codepen.io")) return true;
-  } catch (e) {
-    // ignore parse failures
-  }
+  } catch (e) {}
 
   return false;
 }
@@ -72,15 +68,13 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
-
-// If you want to be extra explicit for old proxies:
 app.options("*", cors());
 
 app.use(express.json({ limit: "1mb" }));
 
-// -------------------------
-// Session (cookie) for Outlook tokens + PKCE verifier
-// -------------------------
+/* ============================================================
+   Session (cookie) for Outlook tokens + PKCE verifier
+============================================================ */
 const PORT = process.env.PORT || 10000;
 const baseUrl =
   process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
@@ -94,12 +88,10 @@ app.use(
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      // 🔥 IMPORTANT:
-      // - If front is on a different origin (CodePen), cookies need SameSite=None and Secure.
-      // - "lax" will NOT send cookie on cross-site fetch.
+      // cross-site fetch (CodePen) needs SameSite=None + Secure
       sameSite: isProd ? "none" : "lax",
-      secure: isProd, // required when sameSite "none"
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      secure: isProd,
+      maxAge: 7 * 24 * 60 * 60 * 1000,
     },
   })
 );
@@ -134,12 +126,10 @@ const {
 const MONDAY_TTL_MS = Number(MONDAY_TTL_MS_ENV || 25000);
 const MONDAY_ITEMS_LIMIT = Number(MONDAY_ITEMS_LIMIT_ENV || 50);
 
-// ✅ Services v3 defaults
 const DEFAULT_BOARD_ID = Number(MONDAY_BOARD_ID || 18290169368);
 const DEFAULT_GROUP_ID = String(MONDAY_GROUP_ID || "topics");
 const MONDAY_API_VERSION = MONDAY_API_VERSION_ENV || "2023-10";
 
-// Twilio toggle: serveur OK même si Twilio manquant
 const TWILIO_ENABLED =
   !!TWILIO_ACCOUNT_SID &&
   !!TWILIO_API_KEY &&
@@ -187,7 +177,6 @@ console.log("ENV vars loaded:", {
   TWILIO_TOKEN_TTL: TWILIO_TOKEN_TTL
     ? `✓ (${TWILIO_TOKEN_TTL}s)`
     : "default 3600s",
-  CORS_ALLOWED_ORIGINS: allowedOrigins,
   SAME_SITE: isProd ? "none" : "lax",
 });
 
@@ -433,8 +422,8 @@ app.get("/api/monday/tickets", async (req, res) => {
       const afi_ticket_id = toAfiTicketId(item.id);
 
       return {
-        id: item.id, // monday item id
-        afi_ticket_id, // derived AFI-0000
+        id: item.id,
+        afi_ticket_id,
         name: item.name,
         updated_at: item.updated_at,
         group: item.group || null,
@@ -466,8 +455,6 @@ app.get("/api/monday/tickets", async (req, res) => {
 
 /* ============================================================
    4.1) LOOKUP BY AFI ID OR HASH
-   GET /api/monday/ticket-by-key?afiId=AFI-0058
-   GET /api/monday/ticket-by-key?hash=69123...
 ============================================================ */
 app.get("/api/monday/ticket-by-key", async (req, res) => {
   try {
@@ -548,7 +535,7 @@ app.get("/api/monday/ticket-by-key", async (req, res) => {
 });
 
 /* ============================================================
-   5) MONDAY CREATE TICKET (Paperform -> topics)
+   5) MONDAY CREATE / UPSERT / RESOLVE
 ============================================================ */
 const INTENT_MAP = {
   service: "🔧 Service",
@@ -556,11 +543,7 @@ const INTENT_MAP = {
   parts: "🔩 Pièce",
   quote: "💰 Soumission",
 };
-
-const LANGUAGE_MAP = {
-  fr: "🃏 Français",
-  en: "🇬🇧 English",
-};
+const LANGUAGE_MAP = { fr: "🃏 Français", en: "🇬🇧 English" };
 
 app.post("/api/monday/create-ticket", async (req, res) => {
   console.log("[API] 🧾 Creating Monday ticket...");
@@ -591,7 +574,6 @@ app.post("/api/monday/create-ticket", async (req, res) => {
   const item_name = `Ticket AFI – ${full_name} – ${intent}`;
 
   const column_values = {
-    // ✅ Services v3 mapping
     text_mkx51q5v: full_name || "",
     phone_mkx5xy3x: phone || "",
     email_mkx53410: email || "",
@@ -601,8 +583,6 @@ app.post("/api/monday/create-ticket", async (req, res) => {
     color_mkx5e9jt: mapped_language,
     date_mkx5asat:
       zap_meta_timestamp || new Date().toISOString().split("T")[0],
-
-    // ✅ Ticket Hash column
     text_mkx5q1ss: ticket_hash || "",
   };
 
@@ -626,7 +606,6 @@ app.post("/api/monday/create-ticket", async (req, res) => {
     });
 
     if (data.errors) return res.status(400).json({ errors: data.errors });
-
     mondayCache.data = null;
 
     const created = data?.data?.create_item;
@@ -651,9 +630,6 @@ app.post("/api/monday/create-ticket", async (req, res) => {
   }
 });
 
-/* ============================================================
-   5.1) MONDAY UPSERT TICKET (front -> Monday)
-============================================================ */
 app.post("/api/monday/upsert-ticket", async (req, res) => {
   console.log("[API] ♻️ Upserting Monday ticket...");
 
@@ -689,7 +665,6 @@ app.post("/api/monday/upsert-ticket", async (req, res) => {
     });
 
     if (data.errors) return res.status(400).json({ errors: data.errors });
-
     mondayCache.data = null;
 
     res.json({
@@ -708,20 +683,15 @@ app.post("/api/monday/upsert-ticket", async (req, res) => {
   }
 });
 
-/* ============================================================
-   5.2) MONDAY RESOLVE TICKET (front -> Monday)
-============================================================ */
 app.post("/api/monday/resolve-ticket", async (req, res) => {
   console.log("[API] ✅ Resolving Monday ticket...");
 
   try {
     const { ticketId, mondayItemId } = req.body || {};
     const itemId = String(mondayItemId || ticketId);
-    if (!itemId) {
-      return res.status(400).json({ error: "ticketId missing" });
-    }
+    if (!itemId) return res.status(400).json({ error: "ticketId missing" });
 
-    const colVals = { color_mkx55mz3: "✅ Résolu" }; // Statut
+    const colVals = { color_mkx55mz3: "✅ Résolu" };
 
     const mutation = `
       mutation ($itemId: ID!, $cols: JSON!) {
@@ -739,7 +709,6 @@ app.post("/api/monday/resolve-ticket", async (req, res) => {
     });
 
     if (data.errors) return res.status(400).json({ errors: data.errors });
-
     mondayCache.data = null;
 
     res.json({
@@ -762,16 +731,15 @@ app.post("/api/monday/resolve-ticket", async (req, res) => {
    6) TRANSCRIPT ENDPOINTS (POC SAFE)
 ============================================================ */
 app.get("/api/transcript/active", (req, res) => {
-  return res.status(501).json({
+  res.status(501).json({
     ok: false,
     errorCode: "TRANSCRIPT_NOT_IMPLEMENTED",
     message: "Transcript backend not wired yet.",
     text: "",
   });
 });
-
 app.get("/api/transcript/by-sid", (req, res) => {
-  return res.status(501).json({
+  res.status(501).json({
     ok: false,
     errorCode: "TRANSCRIPT_NOT_IMPLEMENTED",
     message: "Transcript backend not wired yet.",
@@ -780,7 +748,11 @@ app.get("/api/transcript/by-sid", (req, res) => {
 });
 
 /* ============================================================
-   7) OUTLOOK AUTH (PKCE) + CALLBACK + STATUS + MESSAGES
+   7) OUTLOOK AUTH (PKCE) + CALLBACK + STATUS + EMAILS
+   - Front expects:
+     GET /api/outlook-auth      -> { url }
+     GET /api/outlook-status    -> { connected, account }
+     GET /api/outlook-emails    -> emails[]
 ============================================================ */
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 const OUTLOOK_SCOPES = [
@@ -792,7 +764,6 @@ const OUTLOOK_SCOPES = [
   "Mail.Send",
 ].join(" ");
 
-// --- PKCE helpers ---
 function base64UrlEncode(buffer) {
   return buffer
     .toString("base64")
@@ -800,29 +771,24 @@ function base64UrlEncode(buffer) {
     .replace(/\//g, "_")
     .replace(/=+$/, "");
 }
-
 function sha256(verifier) {
   return crypto.createHash("sha256").update(verifier).digest();
 }
-
 function buildPkcePair() {
   const verifier = base64UrlEncode(crypto.randomBytes(32));
   const challenge = base64UrlEncode(sha256(verifier));
   return { verifier, challenge, method: "S256" };
 }
-
 function getRedirectUri() {
   return (
     OUTLOOK_REDIRECT_URI ||
     `${baseUrl.replace(/\/$/, "")}/api/outlook/callback`
   );
 }
-
 function outlookConfigured() {
   return !!OUTLOOK_CLIENT_ID && !!OUTLOOK_TENANT_ID;
 }
 
-// --- Token refresh helper ---
 async function refreshOutlookTokenIfNeeded(req) {
   const tokens = req.session?.outlookTokens;
   if (!tokens?.refresh_token) return null;
@@ -830,7 +796,7 @@ async function refreshOutlookTokenIfNeeded(req) {
   const now = Date.now();
   const obtainedAt = tokens.obtained_at || 0;
   const expiresInMs = (tokens.expires_in || 0) * 1000;
-  const stillValid = obtainedAt + expiresInMs - 60_000 > now; // 60s buffer
+  const stillValid = obtainedAt + expiresInMs - 60_000 > now;
 
   if (stillValid && tokens.access_token) return tokens;
 
@@ -861,11 +827,11 @@ async function refreshOutlookTokenIfNeeded(req) {
 
 /**
  * GET /api/outlook-auth
- * Redirect vers Azure AD (Auth code + PKCE)
+ * Front wants a JSON URL. If you pass ?redirect=1, it redirects.
  */
 app.get("/api/outlook-auth", (req, res) => {
   try {
-    console.log("[Outlook] 🔐 Redirecting to OAuth (PKCE)...");
+    console.log("[Outlook] 🔐 Building OAuth URL (PKCE)...");
 
     if (!outlookConfigured()) {
       return res.status(500).json({
@@ -888,7 +854,11 @@ app.get("/api/outlook-auth", (req, res) => {
       `&code_challenge=${challenge}` +
       `&code_challenge_method=${method}`;
 
-    return res.redirect(authUrl);
+    if (req.query.redirect === "1") {
+      return res.redirect(authUrl);
+    }
+
+    return res.json({ url: authUrl });
   } catch (e) {
     console.error("[Outlook] auth error:", e.message);
     res.status(500).json({ error: e.message });
@@ -910,11 +880,9 @@ app.get("/api/outlook/callback", async (req, res) => {
           `<h1>Outlook - Erreur</h1><p>${error_description || error}</p>`
         );
     }
-
     if (!code) {
       return res.status(400).send("<h1>Outlook - Code manquant</h1>");
     }
-
     if (!OUTLOOK_CLIENT_ID || !OUTLOOK_CLIENT_SECRET || !OUTLOOK_TENANT_ID) {
       return res
         .status(500)
@@ -949,7 +917,6 @@ app.get("/api/outlook/callback", async (req, res) => {
       obtained_at: Date.now(),
     };
 
-    // Fetch user profile to get displayName/mail
     let account = null;
     try {
       const meRes = await axios.get(`${GRAPH_BASE}/me`, {
@@ -993,7 +960,6 @@ app.get("/api/outlook/callback", async (req, res) => {
 
 /**
  * GET /api/outlook-status
- * Vérifie si un token valide est disponible (refresh auto)
  */
 app.get("/api/outlook-status", async (req, res) => {
   try {
@@ -1024,10 +990,10 @@ app.get("/api/outlook-status", async (req, res) => {
 });
 
 /**
- * GET /api/outlook-messages?email=...&ticketId=...
- * Appelle Graph /me/messages avec filtres optionnels
+ * Core emails handler (Graph)
+ * used by /api/outlook-emails AND /api/outlook-messages
  */
-app.get("/api/outlook-messages", async (req, res) => {
+async function handleOutlookEmails(req, res) {
   try {
     if (!outlookConfigured()) {
       return res.status(500).json({
@@ -1049,7 +1015,6 @@ app.get("/api/outlook-messages", async (req, res) => {
     const clientEmail = String(req.query.email || "").trim();
     const ticketId = String(req.query.ticketId || "").trim();
 
-    // Build $filter
     const filters = [];
 
     if (ticketId) {
@@ -1069,9 +1034,7 @@ app.get("/api/outlook-messages", async (req, res) => {
       $select: "subject,from,receivedDateTime,bodyPreview,webLink",
       $orderby: "receivedDateTime desc",
     });
-    if (filters.length > 0) {
-      params.set("$filter", filters.join(" and "));
-    }
+    if (filters.length > 0) params.set("$filter", filters.join(" and "));
 
     const url = `${GRAPH_BASE}/me/messages?${params.toString()}`;
 
@@ -1097,14 +1060,20 @@ app.get("/api/outlook-messages", async (req, res) => {
 
     return res.json(items);
   } catch (e) {
-    console.error("[Outlook] messages error:", e.message);
+    console.error("[Outlook] emails error:", e.message);
     res.status(500).json({
       errorCode: "OUTLOOK_MESSAGES_ERROR",
       error: e.message || "Failed to fetch Outlook messages",
       items: [],
     });
   }
-});
+}
+
+// ✅ Front-expected route:
+app.get("/api/outlook-emails", handleOutlookEmails);
+
+// ✅ Backward-compatible alias:
+app.get("/api/outlook-messages", handleOutlookEmails);
 
 /* ============================================================
    8) TIDIO CONFIG
