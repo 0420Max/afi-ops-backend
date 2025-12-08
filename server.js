@@ -80,6 +80,9 @@ const baseUrl =
   process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 const isProd = !!process.env.RENDER_EXTERNAL_URL;
 
+// ✅ IMPORTANT for Render HTTPS proxy
+if (isProd) app.set("trust proxy", 1);
+
 app.use(
   session({
     name: "afiops.sid",
@@ -749,10 +752,6 @@ app.get("/api/transcript/by-sid", (req, res) => {
 
 /* ============================================================
    7) OUTLOOK AUTH (PKCE) + CALLBACK + STATUS + EMAILS
-   - Front expects:
-     GET /api/outlook-auth      -> { url }
-     GET /api/outlook-status    -> { connected, account }
-     GET /api/outlook-emails    -> emails[]
 ============================================================ */
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 const OUTLOOK_SCOPES = [
@@ -825,10 +824,6 @@ async function refreshOutlookTokenIfNeeded(req) {
   return newTokens;
 }
 
-/**
- * GET /api/outlook-auth
- * Front wants a JSON URL. If you pass ?redirect=1, it redirects.
- */
 app.get("/api/outlook-auth", (req, res) => {
   try {
     console.log("[Outlook] 🔐 Building OAuth URL (PKCE)...");
@@ -865,10 +860,6 @@ app.get("/api/outlook-auth", (req, res) => {
   }
 });
 
-/**
- * GET /api/outlook/callback
- * Exchange code -> tokens, store in session cookie
- */
 app.get("/api/outlook/callback", async (req, res) => {
   try {
     const { code, error, error_description } = req.query;
@@ -958,9 +949,6 @@ app.get("/api/outlook/callback", async (req, res) => {
   }
 });
 
-/**
- * GET /api/outlook-status
- */
 app.get("/api/outlook-status", async (req, res) => {
   try {
     if (!outlookConfigured()) {
@@ -989,10 +977,6 @@ app.get("/api/outlook-status", async (req, res) => {
   }
 });
 
-/**
- * Core emails handler (Graph)
- * used by /api/outlook-emails AND /api/outlook-messages
- */
 async function handleOutlookEmails(req, res) {
   try {
     if (!outlookConfigured()) {
@@ -1069,32 +1053,27 @@ async function handleOutlookEmails(req, res) {
   }
 }
 
-// ✅ Front-expected route:
 app.get("/api/outlook-emails", handleOutlookEmails);
-
-// ✅ Backward-compatible alias:
 app.get("/api/outlook-messages", handleOutlookEmails);
 
 /* ============================================================
-   8) TIDIO CONFIG
+   8) TIDIO CONFIG + 9) YOUTUBE SEARCH + 10) ERRORS
 ============================================================ */
+// (identique à ton code)
 app.get("/api/tidio-config", (req, res) => {
   try {
-    if (!TIDIO_PROJECT_ID) {
+    if (!process.env.TIDIO_PROJECT_ID) {
       return res.status(500).json({
         errorCode: "TIDIO_CONFIG_INCOMPLETE",
         error: "Missing TIDIO_PROJECT_ID",
       });
     }
-    res.json({ projectId: TIDIO_PROJECT_ID });
+    res.json({ projectId: process.env.TIDIO_PROJECT_ID });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-/* ============================================================
-   9) YOUTUBE SEARCH (widget)
-============================================================ */
 const YT_CACHE_TTL_MS = 60_000;
 const ytCache = new Map();
 
@@ -1162,9 +1141,6 @@ async function handleYoutubeSearch(req, res) {
 app.get("/api/youtube/search", handleYoutubeSearch);
 app.get("/api/youtube-search", handleYoutubeSearch);
 
-/* ============================================================
-   10) ERROR HANDLING
-============================================================ */
 app.use((err, req, res, next) => {
   console.error("[Error]", err);
   res.status(500).json({
@@ -1173,9 +1149,6 @@ app.use((err, req, res, next) => {
   });
 });
 
-/* ============================================================
-   11) START SERVER
-============================================================ */
 app.listen(PORT, () => {
   console.log(`✅ Backend running on port ${PORT}`);
   console.log(`📍 URL: ${baseUrl}`);
