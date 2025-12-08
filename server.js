@@ -80,7 +80,7 @@ const baseUrl =
   process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 const isProd = !!process.env.RENDER_EXTERNAL_URL;
 
-// ✅ IMPORTANT for Render HTTPS proxy
+// IMPORTANT for Render HTTPS proxy
 if (isProd) app.set("trust proxy", 1);
 
 app.use(
@@ -1057,23 +1057,25 @@ app.get("/api/outlook-emails", handleOutlookEmails);
 app.get("/api/outlook-messages", handleOutlookEmails);
 
 /* ============================================================
-   8) TIDIO CONFIG + 9) YOUTUBE SEARCH + 10) ERRORS
+   8) TIDIO CONFIG
 ============================================================ */
-// (identique à ton code)
 app.get("/api/tidio-config", (req, res) => {
   try {
-    if (!process.env.TIDIO_PROJECT_ID) {
+    if (!TIDIO_PROJECT_ID) {
       return res.status(500).json({
         errorCode: "TIDIO_CONFIG_INCOMPLETE",
         error: "Missing TIDIO_PROJECT_ID",
       });
     }
-    res.json({ projectId: process.env.TIDIO_PROJECT_ID });
+    res.json({ projectId: TIDIO_PROJECT_ID });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
+/* ============================================================
+   9) YOUTUBE SEARCH (widget)
+============================================================ */
 const YT_CACHE_TTL_MS = 60_000;
 const ytCache = new Map();
 
@@ -1141,6 +1143,9 @@ async function handleYoutubeSearch(req, res) {
 app.get("/api/youtube/search", handleYoutubeSearch);
 app.get("/api/youtube-search", handleYoutubeSearch);
 
+/* ============================================================
+   10) ERROR HANDLING
+============================================================ */
 app.use((err, req, res, next) => {
   console.error("[Error]", err);
   res.status(500).json({
@@ -1149,6 +1154,9 @@ app.use((err, req, res, next) => {
   });
 });
 
+/* ============================================================
+   11) START SERVER
+============================================================ */
 app.listen(PORT, () => {
   console.log(`✅ Backend running on port ${PORT}`);
   console.log(`📍 URL: ${baseUrl}`);
