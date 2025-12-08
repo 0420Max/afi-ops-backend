@@ -1141,7 +1141,11 @@ async function handleYoutubeSearch(req, res) {
 }
 
 app.get("/api/youtube/search", handleYoutubeSearch);
-app.get("/api/youtube-search", handleYoutubeSearch);
+app.get("/
+// Alias routes for legacy front-end endpoints
+app.get("/api/outlook/auth-url", (req, res) => res.redirect("/api/outlook-auth"));
+app.get("/api/outlook/messages", handleOutlookEmails);
+api/youtube-search", handleYoutubeSearch);
 
 /* ============================================================
    10) ERROR HANDLING
