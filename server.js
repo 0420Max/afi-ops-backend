@@ -31,15 +31,61 @@ const session = require("express-session");
 require("dotenv").config();
 
 const app = express();
-app.use(cors({
-  origin: true,
-  credentials: true,
-}));
+
+/* ============================================================
+   CORS (FIX credentials + origins explicites)
+   - Required because front uses credentials: "include"
+   - "*" is illegal with credentials
+============================================================ */
+const allowedOrigins = [
+  "https://cdpn.io",
+  "https://codepen.io",
+  "https://afi-ops-frontend.onrender.com", // futur front hosted
+  "http://localhost:5173",
+  "http://localhost:3000",
+];
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // Postman / server-to-server / same-origin
+  if (allowedOrigins.includes(origin)) return true;
+
+  // allow CodePen hash subdomains like https://abc123.cdpn.io
+  try {
+    const u = new URL(origin);
+    const host = u.hostname.toLowerCase();
+    if (host.endsWith(".cdpn.io") || host.endsWith(".codepen.io")) return true;
+  } catch (e) {
+    // ignore parse failures
+  }
+
+  return false;
+}
+
+app.use(
+  cors({
+    origin(origin, cb) {
+      if (isAllowedOrigin(origin)) return cb(null, true);
+      return cb(new Error("Origin non autorisée: " + origin));
+    },
+    credentials: true,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+// If you want to be extra explicit for old proxies:
+app.options("*", cors());
+
 app.use(express.json({ limit: "1mb" }));
 
 // -------------------------
 // Session (cookie) for Outlook tokens + PKCE verifier
 // -------------------------
+const PORT = process.env.PORT || 10000;
+const baseUrl =
+  process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+const isProd = !!process.env.RENDER_EXTERNAL_URL;
+
 app.use(
   session({
     name: "afiops.sid",
@@ -48,16 +94,15 @@ app.use(
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      sameSite: "lax", // set to "none" + secure true if cross-site https
-      secure: !!process.env.RENDER_EXTERNAL_URL, // true on Render/https
+      // 🔥 IMPORTANT:
+      // - If front is on a different origin (CodePen), cookies need SameSite=None and Secure.
+      // - "lax" will NOT send cookie on cross-site fetch.
+      sameSite: isProd ? "none" : "lax",
+      secure: isProd, // required when sameSite "none"
       maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     },
   })
 );
-
-const PORT = process.env.PORT || 10000;
-const baseUrl =
-  process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 
 /* ============================================================
    ENV / CONFIG SNAPSHOT
@@ -142,6 +187,8 @@ console.log("ENV vars loaded:", {
   TWILIO_TOKEN_TTL: TWILIO_TOKEN_TTL
     ? `✓ (${TWILIO_TOKEN_TTL}s)`
     : "default 3600s",
+  CORS_ALLOWED_ORIGINS: allowedOrigins,
+  SAME_SITE: isProd ? "none" : "lax",
 });
 
 if (!TWILIO_ENABLED) {
@@ -386,8 +433,8 @@ app.get("/api/monday/tickets", async (req, res) => {
       const afi_ticket_id = toAfiTicketId(item.id);
 
       return {
-        id: item.id,                 // monday item id
-        afi_ticket_id,               // derived AFI-0000
+        id: item.id, // monday item id
+        afi_ticket_id, // derived AFI-0000
         name: item.name,
         updated_at: item.updated_at,
         group: item.group || null,
@@ -454,8 +501,7 @@ app.get("/api/monday/ticket-by-key", async (req, res) => {
 
     if (data.errors) return res.status(400).json({ errors: data.errors });
 
-    const rawItems =
-      data?.data?.boards?.[0]?.items_page?.items || [];
+    const rawItems = data?.data?.boards?.[0]?.items_page?.items || [];
 
     const normalized = rawItems.map((item) => {
       const cols = item.column_values || [];
@@ -1007,15 +1053,12 @@ app.get("/api/outlook-messages", async (req, res) => {
     const filters = [];
 
     if (ticketId) {
-      // contains(subject,'T-1042') or any internal key
       const safeTicket = ticketId.replace(/'/g, "''");
       filters.push(`contains(subject,'${safeTicket}')`);
     }
 
     if (clientEmail) {
       const safeEmail = clientEmail.replace(/'/g, "''");
-      // from/emailAddress/address eq '{clientEmail}'
-      // OR toRecipients/any(...)
       filters.push(
         `(from/emailAddress/address eq '${safeEmail}' or toRecipients/any(r:r/emailAddress/address eq '${safeEmail}'))`
       );
