@@ -12,7 +12,8 @@
  * ✅ Ticket lookup by AFI-ID or Hash
  * ✅ Transcript endpoints (POC safe, return 501 if not wired)
  * ✅ YouTube Search proxy (widget)
- * ✅ Outlook OAuth URL helper + callback + status (POC in-memory)
+ * ✅ Outlook OAuth URL helper + callback + status (PKCE + session cookie)
+ * ✅ Outlook messages fetch via Graph (+ optional filters)
  * ✅ Tidio config helper
  *
  * IMPORTANT:
@@ -25,11 +26,34 @@ const express = require("express");
 const twilio = require("twilio");
 const axios = require("axios");
 const cors = require("cors");
+const crypto = require("crypto");
+const session = require("express-session");
 require("dotenv").config();
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: true,
+  credentials: true,
+}));
 app.use(express.json({ limit: "1mb" }));
+
+// -------------------------
+// Session (cookie) for Outlook tokens + PKCE verifier
+// -------------------------
+app.use(
+  session({
+    name: "afiops.sid",
+    secret: process.env.SESSION_SECRET || "afi-ops-dev-secret-change-me",
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: "lax", // set to "none" + secure true if cross-site https
+      secure: !!process.env.RENDER_EXTERNAL_URL, // true on Render/https
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    },
+  })
+);
 
 const PORT = process.env.PORT || 10000;
 const baseUrl =
@@ -76,11 +100,6 @@ const TWILIO_ENABLED =
   !!TWILIO_API_KEY &&
   !!TWILIO_API_SECRET &&
   !!TWILIO_TWIML_APP_SID;
-
-/* ============================================================
-   OUTLOOK TOKEN STORE (in-memory POC)
-============================================================ */
-const outlookTokens = { default: null };
 
 /* ============================================================
    UTIL: AFI ID DERIVATION (Approche B)
@@ -135,6 +154,8 @@ if (!TWILIO_ENABLED) {
    0) HEALTH CHECK
 ============================================================ */
 app.get("/", (req, res) => {
+  const tokens = req.session?.outlookTokens || null;
+
   res.json({
     status: "AFI OPS Backend OK",
     timestamp: new Date().toISOString(),
@@ -144,7 +165,7 @@ app.get("/", (req, res) => {
       monday: !!MONDAY_TOKEN ? "ready" : "missing_token",
       outlook:
         OUTLOOK_CLIENT_ID && OUTLOOK_TENANT_ID
-          ? outlookTokens.default
+          ? tokens?.access_token
             ? "connected"
             : "configured_not_connected"
           : "not_configured",
@@ -713,35 +734,125 @@ app.get("/api/transcript/by-sid", (req, res) => {
 });
 
 /* ============================================================
-   7) OUTLOOK AUTH URL + CALLBACK + STATUS
+   7) OUTLOOK AUTH (PKCE) + CALLBACK + STATUS + MESSAGES
 ============================================================ */
-app.post("/api/outlook-auth", (req, res) => {
+const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
+const OUTLOOK_SCOPES = [
+  "openid",
+  "profile",
+  "email",
+  "offline_access",
+  "Mail.Read",
+  "Mail.Send",
+].join(" ");
+
+// --- PKCE helpers ---
+function base64UrlEncode(buffer) {
+  return buffer
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+function sha256(verifier) {
+  return crypto.createHash("sha256").update(verifier).digest();
+}
+
+function buildPkcePair() {
+  const verifier = base64UrlEncode(crypto.randomBytes(32));
+  const challenge = base64UrlEncode(sha256(verifier));
+  return { verifier, challenge, method: "S256" };
+}
+
+function getRedirectUri() {
+  return (
+    OUTLOOK_REDIRECT_URI ||
+    `${baseUrl.replace(/\/$/, "")}/api/outlook/callback`
+  );
+}
+
+function outlookConfigured() {
+  return !!OUTLOOK_CLIENT_ID && !!OUTLOOK_TENANT_ID;
+}
+
+// --- Token refresh helper ---
+async function refreshOutlookTokenIfNeeded(req) {
+  const tokens = req.session?.outlookTokens;
+  if (!tokens?.refresh_token) return null;
+
+  const now = Date.now();
+  const obtainedAt = tokens.obtained_at || 0;
+  const expiresInMs = (tokens.expires_in || 0) * 1000;
+  const stillValid = obtainedAt + expiresInMs - 60_000 > now; // 60s buffer
+
+  if (stillValid && tokens.access_token) return tokens;
+
+  const tokenUrl = `https://login.microsoftonline.com/${OUTLOOK_TENANT_ID}/oauth2/v2.0/token`;
+  const params = new URLSearchParams({
+    client_id: OUTLOOK_CLIENT_ID,
+    client_secret: OUTLOOK_CLIENT_SECRET,
+    grant_type: "refresh_token",
+    refresh_token: tokens.refresh_token,
+    redirect_uri: getRedirectUri(),
+    scope: OUTLOOK_SCOPES,
+  });
+
+  const r = await axios.post(tokenUrl, params.toString(), {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    timeout: 15000,
+  });
+
+  const newTokens = {
+    ...tokens,
+    ...r.data,
+    obtained_at: Date.now(),
+  };
+
+  req.session.outlookTokens = newTokens;
+  return newTokens;
+}
+
+/**
+ * GET /api/outlook-auth
+ * Redirect vers Azure AD (Auth code + PKCE)
+ */
+app.get("/api/outlook-auth", (req, res) => {
   try {
-    console.log("[Outlook] 🔐 Generating OAuth URL...");
+    console.log("[Outlook] 🔐 Redirecting to OAuth (PKCE)...");
 
-    const clientId = OUTLOOK_CLIENT_ID;
-    const tenantId = OUTLOOK_TENANT_ID;
-    const redirectUri =
-      OUTLOOK_REDIRECT_URI ||
-      `${baseUrl.replace(/\/$/, "")}/api/outlook/callback`;
-
-    if (!clientId || !tenantId) {
+    if (!outlookConfigured()) {
       return res.status(500).json({
         errorCode: "OUTLOOK_CONFIG_INCOMPLETE",
         error: "Missing OUTLOOK_CLIENT_ID or OUTLOOK_TENANT_ID",
       });
     }
 
-    const authUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(
-      redirectUri
-    )}&response_type=code&scope=Mail.Read Mail.Send offline_access`;
+    const { verifier, challenge, method } = buildPkcePair();
+    req.session.pkce = { verifier, challenge, method, created_at: Date.now() };
 
-    res.json({ authUrl });
+    const redirectUri = getRedirectUri();
+    const authUrl =
+      `https://login.microsoftonline.com/${OUTLOOK_TENANT_ID}` +
+      `/oauth2/v2.0/authorize?client_id=${OUTLOOK_CLIENT_ID}` +
+      `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+      `&response_type=code` +
+      `&response_mode=query` +
+      `&scope=${encodeURIComponent(OUTLOOK_SCOPES)}` +
+      `&code_challenge=${challenge}` +
+      `&code_challenge_method=${method}`;
+
+    return res.redirect(authUrl);
   } catch (e) {
+    console.error("[Outlook] auth error:", e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
+/**
+ * GET /api/outlook/callback
+ * Exchange code -> tokens, store in session cookie
+ */
 app.get("/api/outlook/callback", async (req, res) => {
   try {
     const { code, error, error_description } = req.query;
@@ -764,16 +875,22 @@ app.get("/api/outlook/callback", async (req, res) => {
         .send("<h1>Outlook non configuré côté backend.</h1>");
     }
 
-    const tokenUrl = `https://login.microsoftonline.com/${OUTLOOK_TENANT_ID}/oauth2/v2.0/token`;
+    const pkceVerifier = req.session?.pkce?.verifier;
+    if (!pkceVerifier) {
+      return res
+        .status(400)
+        .send("<h1>PKCE verifier manquant. Recommence le login.</h1>");
+    }
 
+    const tokenUrl = `https://login.microsoftonline.com/${OUTLOOK_TENANT_ID}/oauth2/v2.0/token`;
     const params = new URLSearchParams({
       client_id: OUTLOOK_CLIENT_ID,
       client_secret: OUTLOOK_CLIENT_SECRET,
       grant_type: "authorization_code",
       code,
-      redirect_uri:
-        OUTLOOK_REDIRECT_URI ||
-        `${baseUrl.replace(/\/$/, "")}/api/outlook/callback`,
+      redirect_uri: getRedirectUri(),
+      code_verifier: pkceVerifier,
+      scope: OUTLOOK_SCOPES,
     });
 
     const tokenRes = await axios.post(tokenUrl, params.toString(), {
@@ -781,10 +898,31 @@ app.get("/api/outlook/callback", async (req, res) => {
       timeout: 15000,
     });
 
-    outlookTokens.default = {
+    const rawTokens = {
       ...tokenRes.data,
       obtained_at: Date.now(),
     };
+
+    // Fetch user profile to get displayName/mail
+    let account = null;
+    try {
+      const meRes = await axios.get(`${GRAPH_BASE}/me`, {
+        headers: { Authorization: `Bearer ${rawTokens.access_token}` },
+        timeout: 12000,
+      });
+      const me = meRes.data || {};
+      account = {
+        displayName: me.displayName || "",
+        mail: me.mail || me.userPrincipalName || "",
+        userPrincipalName: me.userPrincipalName || "",
+      };
+    } catch (profileErr) {
+      console.warn("[Outlook] ⚠️ Cannot fetch /me profile:", profileErr.message);
+      account = { displayName: "", mail: "", userPrincipalName: "" };
+    }
+
+    req.session.outlookTokens = { ...rawTokens, account };
+    req.session.pkce = null;
 
     res.send(`
       <html>
@@ -800,26 +938,129 @@ app.get("/api/outlook/callback", async (req, res) => {
       </html>
     `);
   } catch (e) {
+    console.error("[Outlook] callback error:", e.message);
     res
       .status(500)
       .send("<h1>Erreur lors de la récupération du token Outlook.</h1>");
   }
 });
 
-app.get("/api/outlook-status", (req, res) => {
-  const tokens = outlookTokens.default;
-  if (!tokens) return res.json({ connected: false });
+/**
+ * GET /api/outlook-status
+ * Vérifie si un token valide est disponible (refresh auto)
+ */
+app.get("/api/outlook-status", async (req, res) => {
+  try {
+    if (!outlookConfigured()) {
+      return res.json({ connected: false, reason: "not_configured" });
+    }
 
-  const expiresIn = tokens.expires_in
-    ? Math.max(
-        0,
-        Math.floor(
-          (tokens.obtained_at + tokens.expires_in * 1000 - Date.now()) / 1000
-        )
-      )
-    : null;
+    const tokens = await refreshOutlookTokenIfNeeded(req);
+    if (!tokens?.access_token) return res.json({ connected: false });
 
-  res.json({ connected: true, expiresInSeconds: expiresIn });
+    const account = tokens.account || {
+      displayName: "",
+      mail: "",
+      userPrincipalName: "",
+    };
+
+    return res.json({
+      connected: true,
+      account: {
+        displayName: account.displayName,
+        mail: account.mail || account.userPrincipalName,
+      },
+    });
+  } catch (e) {
+    console.error("[Outlook] status error:", e.message);
+    res.status(500).json({ connected: false, error: e.message });
+  }
+});
+
+/**
+ * GET /api/outlook-messages?email=...&ticketId=...
+ * Appelle Graph /me/messages avec filtres optionnels
+ */
+app.get("/api/outlook-messages", async (req, res) => {
+  try {
+    if (!outlookConfigured()) {
+      return res.status(500).json({
+        errorCode: "OUTLOOK_NOT_CONFIGURED",
+        error: "Outlook env vars missing.",
+        items: [],
+      });
+    }
+
+    const tokens = await refreshOutlookTokenIfNeeded(req);
+    if (!tokens?.access_token) {
+      return res.status(401).json({
+        errorCode: "OUTLOOK_NOT_CONNECTED",
+        error: "No Outlook session token found. Call /api/outlook-auth first.",
+        items: [],
+      });
+    }
+
+    const clientEmail = String(req.query.email || "").trim();
+    const ticketId = String(req.query.ticketId || "").trim();
+
+    // Build $filter
+    const filters = [];
+
+    if (ticketId) {
+      // contains(subject,'T-1042') or any internal key
+      const safeTicket = ticketId.replace(/'/g, "''");
+      filters.push(`contains(subject,'${safeTicket}')`);
+    }
+
+    if (clientEmail) {
+      const safeEmail = clientEmail.replace(/'/g, "''");
+      // from/emailAddress/address eq '{clientEmail}'
+      // OR toRecipients/any(...)
+      filters.push(
+        `(from/emailAddress/address eq '${safeEmail}' or toRecipients/any(r:r/emailAddress/address eq '${safeEmail}'))`
+      );
+    }
+
+    const params = new URLSearchParams({
+      $top: "20",
+      $select: "subject,from,receivedDateTime,bodyPreview,webLink",
+      $orderby: "receivedDateTime desc",
+    });
+    if (filters.length > 0) {
+      params.set("$filter", filters.join(" and "));
+    }
+
+    const url = `${GRAPH_BASE}/me/messages?${params.toString()}`;
+
+    const graphRes = await axios.get(url, {
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
+      timeout: 15000,
+    });
+
+    const items = (graphRes.data?.value || []).map((m) => {
+      const fromName =
+        m?.from?.emailAddress?.name ||
+        m?.from?.emailAddress?.address ||
+        "";
+      return {
+        id: m.id,
+        subject: m.subject || "",
+        from: fromName,
+        preview: m.bodyPreview || "",
+        receivedAt: m.receivedDateTime || "",
+        link: m.webLink || "",
+      };
+    });
+
+    return res.json(items);
+  } catch (e) {
+    console.error("[Outlook] messages error:", e.message);
+    res.status(500).json({
+      errorCode: "OUTLOOK_MESSAGES_ERROR",
+      error: e.message || "Failed to fetch Outlook messages",
+      items: [],
+    });
+  }
 });
 
 /* ============================================================
