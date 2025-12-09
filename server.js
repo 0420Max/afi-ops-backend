@@ -1,3 +1,5 @@
+"use strict";
+
 /**
  * AFI OPS Backend (Render / Local)
  * ------------------------------------------------------------
@@ -33,15 +35,26 @@ require("dotenv").config();
 const app = express();
 
 /* ============================================================
-   CORS (FIX credentials + origins explicites)
+   CORS (credentials + origins explicites + override ENV)
 ============================================================ */
-const allowedOrigins = [
+
+const STATIC_ALLOWED_ORIGINS = [
   "https://cdpn.io",
   "https://codepen.io",
   "https://afi-ops-frontend.onrender.com",
   "http://localhost:5173",
   "http://localhost:3000",
 ];
+
+// Optionnel : ALLOWED_ORIGINS="https://mon-cockpit.com,https://autre.app"
+const ENV_ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const allowedOrigins = Array.from(
+  new Set([...STATIC_ALLOWED_ORIGINS, ...ENV_ALLOWED_ORIGINS])
+);
 
 function isAllowedOrigin(origin) {
   if (!origin) return true; // Postman / server-to-server / no-origin
@@ -75,6 +88,7 @@ app.use(express.json({ limit: "1mb" }));
 /* ============================================================
    Session (cookie) for Outlook tokens + PKCE verifier
 ============================================================ */
+
 const PORT = process.env.PORT || 10000;
 const baseUrl =
   process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
@@ -91,7 +105,7 @@ app.use(
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      // cross-site fetch (CodePen) needs SameSite=None + Secure
+      // cross-site fetch (CodePen, cockpit externe) → SameSite=None + Secure
       sameSite: isProd ? "none" : "lax",
       secure: isProd,
       maxAge: 7 * 24 * 60 * 60 * 1000,
@@ -102,6 +116,7 @@ app.use(
 /* ============================================================
    ENV / CONFIG SNAPSHOT
 ============================================================ */
+
 const {
   TWILIO_ACCOUNT_SID,
   TWILIO_API_KEY,
@@ -142,6 +157,7 @@ const TWILIO_ENABLED =
 /* ============================================================
    UTIL: AFI ID DERIVATION (Approche B)
 ============================================================ */
+
 function toAfiTicketId(mondayItemId) {
   const n = Number(mondayItemId || 0);
   const padded = String(n).padStart(4, "0");
@@ -151,7 +167,9 @@ function toAfiTicketId(mondayItemId) {
 /* ============================================================
    LOG ENV CHECK
 ============================================================ */
+
 console.log("🚀 AFI OPS Backend starting...");
+console.log("Allowed origins:", allowedOrigins);
 console.log("ENV vars loaded:", {
   TWILIO_ACCOUNT_SID: TWILIO_ACCOUNT_SID ? "✓" : "✗",
   TWILIO_API_KEY: TWILIO_API_KEY ? "✓(SK...)" : "✗",
@@ -192,6 +210,7 @@ if (!TWILIO_ENABLED) {
 /* ============================================================
    0) HEALTH CHECK
 ============================================================ */
+
 app.get("/", (req, res) => {
   const tokens = req.session?.outlookTokens || null;
 
@@ -218,6 +237,7 @@ app.get("/", (req, res) => {
 /* ============================================================
    0.1) TWILIO HEALTH (debug)
 ============================================================ */
+
 app.get("/api/twilio/health", (req, res) => {
   if (!TWILIO_ENABLED) {
     return res.status(503).json({
@@ -241,6 +261,7 @@ app.get("/api/twilio/health", (req, res) => {
 /* ============================================================
    1) TWILIO TOKEN (VoIP)
 ============================================================ */
+
 app.post("/api/twilio-token", (req, res) => {
   try {
     console.log("[Twilio] 🔐 Token request received...");
@@ -293,6 +314,7 @@ app.post("/api/twilio-token", (req, res) => {
 /* ============================================================
    2) TWIML VOICE
 ============================================================ */
+
 app.post("/api/voice", (req, res) => {
   try {
     console.log("[Voice] 📞 Incoming TwiML request...");
@@ -335,6 +357,7 @@ app.post("/api/voice", (req, res) => {
 /* ============================================================
    3) MONDAY HELPERS
 ============================================================ */
+
 const MONDAY_URL = "https://api.monday.com/v2";
 
 function mondayHeaders() {
@@ -358,6 +381,7 @@ async function mondayRequest(query, variables) {
 /* ============================================================
    4) MONDAY TICKETS PROXY + CACHE TTL
 ============================================================ */
+
 const mondayCache = {
   data: null,
   expiresAt: 0,
@@ -459,6 +483,7 @@ app.get("/api/monday/tickets", async (req, res) => {
 /* ============================================================
    4.1) LOOKUP BY AFI ID OR HASH
 ============================================================ */
+
 app.get("/api/monday/ticket-by-key", async (req, res) => {
   try {
     const afiId = String(req.query.afiId || "").trim();
@@ -540,6 +565,7 @@ app.get("/api/monday/ticket-by-key", async (req, res) => {
 /* ============================================================
    5) MONDAY CREATE / UPSERT / RESOLVE
 ============================================================ */
+
 const INTENT_MAP = {
   service: "🔧 Service",
   warranty: "🛡️ Garantie",
@@ -733,6 +759,7 @@ app.post("/api/monday/resolve-ticket", async (req, res) => {
 /* ============================================================
    6) TRANSCRIPT ENDPOINTS (POC SAFE)
 ============================================================ */
+
 app.get("/api/transcript/active", (req, res) => {
   res.status(501).json({
     ok: false,
@@ -741,6 +768,7 @@ app.get("/api/transcript/active", (req, res) => {
     text: "",
   });
 });
+
 app.get("/api/transcript/by-sid", (req, res) => {
   res.status(501).json({
     ok: false,
@@ -753,6 +781,7 @@ app.get("/api/transcript/by-sid", (req, res) => {
 /* ============================================================
    7) OUTLOOK AUTH (PKCE) + CALLBACK + STATUS + EMAILS
 ============================================================ */
+
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 const OUTLOOK_SCOPES = [
   "openid",
@@ -770,20 +799,24 @@ function base64UrlEncode(buffer) {
     .replace(/\//g, "_")
     .replace(/=+$/, "");
 }
+
 function sha256(verifier) {
   return crypto.createHash("sha256").update(verifier).digest();
 }
+
 function buildPkcePair() {
   const verifier = base64UrlEncode(crypto.randomBytes(32));
   const challenge = base64UrlEncode(sha256(verifier));
   return { verifier, challenge, method: "S256" };
 }
+
 function getRedirectUri() {
   return (
     OUTLOOK_REDIRECT_URI ||
     `${baseUrl.replace(/\/$/, "")}/api/outlook/callback`
   );
 }
+
 function outlookConfigured() {
   return !!OUTLOOK_CLIENT_ID && !!OUTLOOK_TENANT_ID;
 }
@@ -927,7 +960,10 @@ app.get("/api/outlook/callback", async (req, res) => {
         userPrincipalName: me.userPrincipalName || "",
       };
     } catch (profileErr) {
-      console.warn("[Outlook] ⚠️ Cannot fetch /me profile:", profileErr.message);
+      console.warn(
+        "[Outlook] ⚠️ Cannot fetch /me profile:",
+        profileErr.message
+      );
       account = { displayName: "", mail: "", userPrincipalName: "" };
     }
 
@@ -1080,6 +1116,7 @@ app.get("/api/outlook-messages", handleOutlookEmails);
 /* ============================================================
    8) TIDIO CONFIG
 ============================================================ */
+
 app.get("/api/tidio-config", (req, res) => {
   try {
     if (!TIDIO_PROJECT_ID) {
@@ -1095,7 +1132,7 @@ app.get("/api/tidio-config", (req, res) => {
 });
 
 /* ============================================================
-9) YOUTUBE SEARCH (widget)
+   9) YOUTUBE SEARCH (widget)
 ============================================================ */
 
 const YT_CACHE_TTL_MS = 60_000;
@@ -1183,6 +1220,7 @@ app.get("/api/outlook/messages", handleOutlookEmails);
 /* ============================================================
    10) ERROR HANDLING
 ============================================================ */
+
 app.use((err, req, res, next) => {
   console.error("[Error]", err);
   res.status(500).json({
@@ -1194,6 +1232,7 @@ app.use((err, req, res, next) => {
 /* ============================================================
    11) START SERVER
 ============================================================ */
+
 app.listen(PORT, () => {
   console.log(`✅ Backend running on port ${PORT}`);
   console.log(`📍 URL: ${baseUrl}`);
