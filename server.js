@@ -835,6 +835,12 @@ app.get("/api/outlook-auth", (req, res) => {
       });
     }
 
+    // Store returnUrl for UX after login (used by frontend)
+    const returnUrl = String(req.query.returnUrl || "").trim();
+    if (returnUrl) {
+      req.session.outlookReturnUrl = returnUrl;
+    }
+
     const { verifier, challenge, method } = buildPkcePair();
     req.session.pkce = { verifier, challenge, method, created_at: Date.now() };
 
@@ -928,15 +934,30 @@ app.get("/api/outlook/callback", async (req, res) => {
     req.session.outlookTokens = { ...rawTokens, account };
     req.session.pkce = null;
 
+    const returnUrl = req.session.outlookReturnUrl || "";
+
     res.send(`
       <html>
         <body style="background:#020617;color:#e5e7eb;font-family:-apple-system,system-ui;padding:32px">
           <h1>Outlook connecté ✅</h1>
           <p>Tu peux fermer cette fenêtre et revenir à AFI OPS Cockpit.</p>
+
+          ${
+            returnUrl
+              ? `<p><a href="${returnUrl}" style="color:#60a5fa">↩ Retour au cockpit</a></p>`
+              : ""
+          }
+
           <script>
-            if (window.opener) {
-              window.opener.postMessage({ type: "OUTLOOK_CONNECTED" }, "*");
-            }
+            try {
+              if (window.opener) {
+                // NEW: bridge message for current frontend
+                window.opener.postMessage({ type: "outlook_oauth_done" }, "*");
+                // Legacy/compat
+                window.opener.postMessage({ type: "OUTLOOK_CONNECTED" }, "*");
+                window.close();
+              }
+            } catch (e) {}
           </script>
         </body>
       </html>
@@ -1003,13 +1024,13 @@ async function handleOutlookEmails(req, res) {
 
     if (ticketId) {
       const safeTicket = ticketId.replace(/'/g, "''");
-      filters.push(`contains(subject,'${safeTicket}')`);
+      filters.push(\`contains(subject,'\${safeTicket}')\`);
     }
 
     if (clientEmail) {
       const safeEmail = clientEmail.replace(/'/g, "''");
       filters.push(
-        `(from/emailAddress/address eq '${safeEmail}' or toRecipients/any(r:r/emailAddress/address eq '${safeEmail}'))`
+        \`(from/emailAddress/address eq '\${safeEmail}' or toRecipients/any(r:r/emailAddress/address eq '\${safeEmail}'))\`
       );
     }
 
@@ -1020,10 +1041,10 @@ async function handleOutlookEmails(req, res) {
     });
     if (filters.length > 0) params.set("$filter", filters.join(" and "));
 
-    const url = `${GRAPH_BASE}/me/messages?${params.toString()}`;
+    const url = \`\${GRAPH_BASE}/me/messages?\${params.toString()}\`;
 
     const graphRes = await axios.get(url, {
-      headers: { Authorization: `Bearer ${tokens.access_token}` },
+      headers: { Authorization: \`Bearer \${tokens.access_token}\` },
       timeout: 15000,
     });
 
