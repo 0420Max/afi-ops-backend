@@ -1024,13 +1024,13 @@ async function handleOutlookEmails(req, res) {
 
     if (ticketId) {
       const safeTicket = ticketId.replace(/'/g, "''");
-      filters.push(\`contains(subject,'\${safeTicket}')\`);
+      filters.push(`contains(subject,'${safeTicket}')`);
     }
 
     if (clientEmail) {
       const safeEmail = clientEmail.replace(/'/g, "''");
       filters.push(
-        \`(from/emailAddress/address eq '\${safeEmail}' or toRecipients/any(r:r/emailAddress/address eq '\${safeEmail}'))\`
+        `(from/emailAddress/address eq '${safeEmail}' or toRecipients/any(r:r/emailAddress/address eq '${safeEmail}'))`
       );
     }
 
@@ -1041,10 +1041,10 @@ async function handleOutlookEmails(req, res) {
     });
     if (filters.length > 0) params.set("$filter", filters.join(" and "));
 
-    const url = \`\${GRAPH_BASE}/me/messages?\${params.toString()}\`;
+    const url = `${GRAPH_BASE}/me/messages?${params.toString()}`;
 
     const graphRes = await axios.get(url, {
-      headers: { Authorization: \`Bearer \${tokens.access_token}\` },
+      headers: { Authorization: `Bearer ${tokens.access_token}` },
       timeout: 15000,
     });
 
