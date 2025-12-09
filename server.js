@@ -1074,8 +1074,9 @@ app.get("/api/tidio-config", (req, res) => {
 });
 
 /* ============================================================
-   9) YOUTUBE SEARCH (widget)
+9) YOUTUBE SEARCH (widget)
 ============================================================ */
+
 const YT_CACHE_TTL_MS = 60_000;
 const ytCache = new Map();
 
@@ -1095,6 +1096,7 @@ async function handleYoutubeSearch(req, res) {
     const cacheKey = q.toLowerCase();
     const now = Date.now();
     const cached = ytCache.get(cacheKey);
+
     if (cached && cached.expiresAt > now) {
       return res.json({ items: cached.items, cached: true });
     }
@@ -1115,6 +1117,7 @@ async function handleYoutubeSearch(req, res) {
         const id = x?.id?.videoId;
         const sn = x?.snippet || {};
         if (!id) return null;
+
         return {
           id,
           title: sn.title || "Video",
@@ -1128,7 +1131,11 @@ async function handleYoutubeSearch(req, res) {
       })
       .filter(Boolean);
 
-    ytCache.set(cacheKey, { items, expiresAt: now + YT_CACHE_TTL_MS });
+    ytCache.set(cacheKey, {
+      items,
+      expiresAt: now + YT_CACHE_TTL_MS,
+    });
+
     res.json({ items });
   } catch (e) {
     console.error("[YouTube] search error:", e.message);
@@ -1140,12 +1147,17 @@ async function handleYoutubeSearch(req, res) {
   }
 }
 
+// Route principale utilisée par le front actuel
 app.get("/api/youtube/search", handleYoutubeSearch);
-app.get("/
-// Alias routes for legacy front-end endpoints
-app.get("/api/outlook/auth-url", (req, res) => res.redirect("/api/outlook-auth"));
+
+// Alias routes pour l'ancien front si besoin
+app.get("/api/youtube-search", handleYoutubeSearch);
+
+// Alias Outlook pour compatibilité legacy
+app.get("/api/outlook/auth-url", (req, res) =>
+  res.redirect("/api/outlook-auth")
+);
 app.get("/api/outlook/messages", handleOutlookEmails);
-api/youtube-search", handleYoutubeSearch);
 
 /* ============================================================
    10) ERROR HANDLING
