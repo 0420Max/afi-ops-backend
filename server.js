@@ -1,1373 +1,633 @@
-"use strict";
-
 /**
+ * AFI OPS Backend • server.js
+ * Canon 2025-12-09
+ *
+ * Endpoints attendus par app.js:
+ *  - POST /api/twilio-token
+ *  - GET  /api/monday/tickets
+ *  - POST /api/monday/upsert-ticket
+ *  - POST /api/monday/resolve-ticket
+ *  - GET  /api/transcript/active
+ *  - GET  /api/transcript/by-sid?sid=
+ *  - GET  /api/outlook-status
+ *  - POST /api/outlook-auth
+ *  - GET  /api/youtube/search?q=
+ *  - POST /api/gpt/analyze-ticket
+ *  - POST /api/gpt/generate-wrap
+ *  - GET  /api/tidio-config
+ *
+ * Assumptions:
+ *  - Monday board a un group "sav" et optionnellement "sales"
+ *  - tes colonnes Monday sont déjà mappées côté front (mapMondayItemToTicket)
+ *  - transcript "active" = dernier transcript en RAM ou DB (ici RAM)
+ *  - visio/outlook: OAuth Graph standard, stock token en mémoire (swap Redis/DB quand tu veux)
+ */
 
-* AFI OPS Backend (Render / Local)
-* ---
-* FEATURES:
-* ✅ Health check
-* ✅ Twilio Voice Token (JWT moderne, avec diagnostics)
-* ✅ TwiML Voice endpoint (outgoing + incoming)
-* ✅ Monday tickets proxy normalisé + cache TTL
-* ✅ Monday Create Ticket (Paperform -> topics)
-* ✅ Monday Upsert Ticket (front -> Monday)
-* ✅ Monday Resolve Ticket (front -> Monday)
-* ✅ Ticket lookup by AFI-ID or Hash
-* ✅ Transcript endpoints (POC safe, return 501 if not wired)
-* ✅ YouTube Search proxy (widget)
-* ✅ Outlook OAuth URL helper + callback + status (PKCE + session cookie)
-* ✅ Outlook emails fetch via Graph (+ optional filters)
-* ✅ Tidio config helper
-* ✅ GPT stubs pour analyse ticket & génération de wrap SAV
-*
-* IMPORTANT:
-* * Monday API: items_page au niveau du board
-* * group_ids ne marche pas dans items_page -> filtre backend
-* * AFI Ticket ID est dérivé du monday item.id (Approche B)
-    */
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import fetch from "node-fetch";
+import Twilio from "twilio";
+import { google } from "googleapis";
+import "dotenv/config";
 
-const express = require("express");
-const twilio = require("twilio");
-const axios = require("axios");
-const cors = require("cors");
-const crypto = require("crypto");
-const session = require("express-session");
-require("dotenv").config();
+// -------------------------
+// 0) APP + MIDDLEWARE
+// -------------------------
 
 const app = express();
+app.set("trust proxy", 1);
 
-/* ============================================================
-CORS (credentials + origins explicites + override ENV)
-============================================================ */
-
-const STATIC_ALLOWED_ORIGINS = [
-"[https://cdpn.io](https://cdpn.io)",
-"[https://codepen.io](https://codepen.io)",
-"[https://afi-ops-frontend.onrender.com](https://afi-ops-frontend.onrender.com)",
-"http://localhost:5173",
-"http://localhost:3000",
-];
-
-// Optionnel : ALLOWED_ORIGINS="[https://mon-cockpit.com,https://autre.app](https://mon-cockpit.com,https://autre.app)"
-const ENV_ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
-.split(",")
-.map((s) => s.trim())
-.filter(Boolean);
-
-const allowedOrigins = Array.from(
-new Set([...STATIC_ALLOWED_ORIGINS, ...ENV_ALLOWED_ORIGINS])
-);
-
-function isAllowedOrigin(origin) {
-if (!origin) return true; // Postman / server-to-server / no-origin
-if (allowedOrigins.includes(origin)) return true;
-
-// allow CodePen hash subdomains like [https://abc123.cdpn.io](https://abc123.cdpn.io)
-try {
-const u = new URL(origin);
-const host = u.hostname.toLowerCase();
-if (host.endsWith(".cdpn.io") || host.endsWith(".codepen.io")) return true;
-} catch (e) {}
-
-return false;
-}
-
+app.use(helmet());
 app.use(
-cors({
-origin(origin, cb) {
-if (isAllowedOrigin(origin)) return cb(null, true);
-return cb(new Error("Origin non autorisée: " + origin));
-},
-credentials: true,
-methods: ["GET", "POST", "OPTIONS"],
-allowedHeaders: ["Content-Type", "Authorization"],
-})
-);
-app.options("*", cors());
-
-app.use(express.json({ limit: "1mb" }));
-
-/* ============================================================
-Session (cookie) for Outlook tokens + PKCE verifier
-============================================================ */
-
-const PORT = process.env.PORT || 10000;
-const baseUrl =
-process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
-const isProd = !!process.env.RENDER_EXTERNAL_URL;
-
-// IMPORTANT for Render HTTPS proxy
-if (isProd) app.set("trust proxy", 1);
-
-app.use(
-session({
-name: "afiops.sid",
-secret: process.env.SESSION_SECRET || "afi-ops-dev-secret-change-me",
-resave: false,
-saveUninitialized: false,
-cookie: {
-httpOnly: true,
-// cross-site fetch (CodePen, cockpit externe) → SameSite=None + Secure
-sameSite: isProd ? "none" : "lax",
-secure: isProd,
-maxAge: 7 * 24 * 60 * 60 * 1000,
-},
-})
-);
-
-/* ============================================================
-ENV / CONFIG SNAPSHOT
-============================================================ */
-
-const {
-TWILIO_ACCOUNT_SID,
-TWILIO_API_KEY,
-TWILIO_API_SECRET,
-TWILIO_TWIML_APP_SID,
-TWILIO_PHONE_NUMBER,
-
-MONDAY_TOKEN,
-MONDAY_BOARD_ID,
-MONDAY_GROUP_ID,
-MONDAY_TTL_MS: MONDAY_TTL_MS_ENV,
-MONDAY_ITEMS_LIMIT: MONDAY_ITEMS_LIMIT_ENV,
-MONDAY_API_VERSION: MONDAY_API_VERSION_ENV,
-
-OUTLOOK_CLIENT_ID,
-OUTLOOK_TENANT_ID,
-OUTLOOK_CLIENT_SECRET,
-OUTLOOK_REDIRECT_URI,
-
-TIDIO_PROJECT_ID,
-TWILIO_TOKEN_TTL,
-YOUTUBE_API_KEY,
-} = process.env;
-
-const MONDAY_TTL_MS = Number(MONDAY_TTL_MS_ENV || 25000);
-const MONDAY_ITEMS_LIMIT = Number(MONDAY_ITEMS_LIMIT_ENV || 50);
-
-const DEFAULT_BOARD_ID = Number(MONDAY_BOARD_ID || 18290169368);
-const DEFAULT_GROUP_ID = String(MONDAY_GROUP_ID || "topics");
-const MONDAY_API_VERSION = MONDAY_API_VERSION_ENV || "2023-10";
-
-const TWILIO_ENABLED =
-!!TWILIO_ACCOUNT_SID &&
-!!TWILIO_API_KEY &&
-!!TWILIO_API_SECRET &&
-!!TWILIO_TWIML_APP_SID;
-
-/* ============================================================
-UTIL: AFI ID DERIVATION (Approche B)
-============================================================ */
-
-function toAfiTicketId(mondayItemId) {
-const n = Number(mondayItemId || 0);
-const padded = String(n).padStart(4, "0");
-return `AFI-${padded}`;
-}
-
-/* ============================================================
-LOG ENV CHECK
-============================================================ */
-
-console.log("🚀 AFI OPS Backend starting...");
-console.log("Allowed origins:", allowedOrigins);
-console.log("ENV vars loaded:", {
-TWILIO_ACCOUNT_SID: TWILIO_ACCOUNT_SID ? "✓" : "✗",
-TWILIO_API_KEY: TWILIO_API_KEY ? "✓(SK...)" : "✗",
-TWILIO_API_SECRET: TWILIO_API_SECRET ? "✓" : "✗",
-TWILIO_TWIML_APP_SID: TWILIO_TWIML_APP_SID ? "✓(AP...)" : "✗",
-TWILIO_PHONE_NUMBER: TWILIO_PHONE_NUMBER ? "✓" : "✗",
-
-MONDAY_TOKEN: MONDAY_TOKEN ? "✓" : "✗",
-MONDAY_BOARD_ID: MONDAY_BOARD_ID ? "✓" : "⚠️ fallback Services v3",
-MONDAY_GROUP_ID: MONDAY_GROUP_ID ? `✓ (${MONDAY_GROUP_ID})` : "default topics",
-MONDAY_TTL_MS: MONDAY_TTL_MS_ENV ? `✓ (${MONDAY_TTL_MS_ENV})` : "default 25s",
-MONDAY_ITEMS_LIMIT: MONDAY_ITEMS_LIMIT_ENV
-? `✓ (${MONDAY_ITEMS_LIMIT_ENV})`
-: "default 50",
-MONDAY_API_VERSION: MONDAY_API_VERSION,
-
-OUTLOOK_CLIENT_ID: OUTLOOK_CLIENT_ID ? "✓" : "✗",
-OUTLOOK_TENANT_ID: OUTLOOK_TENANT_ID ? "✓" : "✗",
-OUTLOOK_CLIENT_SECRET: OUTLOOK_CLIENT_SECRET ? "✓" : "✗",
-OUTLOOK_REDIRECT_URI:
-OUTLOOK_REDIRECT_URI || "⚠️ default /api/outlook/callback",
-
-TIDIO_PROJECT_ID: TIDIO_PROJECT_ID ? "✓" : "✗",
-YOUTUBE_API_KEY: YOUTUBE_API_KEY ? "✓" : "✗",
-
-TWILIO_TOKEN_TTL: TWILIO_TOKEN_TTL
-? `✓ (${TWILIO_TOKEN_TTL}s)`
-: "default 3600s",
-SAME_SITE: isProd ? "none" : "lax",
-});
-
-if (!TWILIO_ENABLED) {
-console.warn(
-"⚠️ Twilio not fully configured. Softphone endpoints will return 503 until env vars are fixed."
-);
-}
-
-/* ============================================================
-0) HEALTH CHECK
-============================================================ */
-
-app.get("/", (req, res) => {
-const tokens = req.session?.outlookTokens || null;
-
-res.json({
-status: "AFI OPS Backend OK",
-timestamp: new Date().toISOString(),
-baseUrl,
-services: {
-twilio: TWILIO_ENABLED ? "ready" : "disabled",
-monday: !!MONDAY_TOKEN ? "ready" : "missing_token",
-outlook:
-OUTLOOK_CLIENT_ID && OUTLOOK_TENANT_ID
-? tokens?.access_token
-? "connected"
-: "configured_not_connected"
-: "not_configured",
-tidio: !!TIDIO_PROJECT_ID ? "ready" : "not_configured",
-youtube: !!YOUTUBE_API_KEY ? "ready" : "missing_key",
-transcript: "poc_safe",
-},
-});
-});
-
-/* ============================================================
-0.1) TWILIO HEALTH (debug)
-============================================================ */
-
-app.get("/api/twilio/health", (req, res) => {
-if (!TWILIO_ENABLED) {
-return res.status(503).json({
-ok: false,
-errorCode: "TWILIO_CONFIG_INCOMPLETE",
-message:
-"Twilio env vars are incomplete. Check TWILIO_ACCOUNT_SID, TWILIO_API_KEY, TWILIO_API_SECRET, TWILIO_TWIML_APP_SID.",
-});
-}
-
-res.json({
-ok: true,
-twilio: {
-accountSid: TWILIO_ACCOUNT_SID.replace(/^(.{6}).+$/, "$1…"),
-twimlAppSid: TWILIO_TWIML_APP_SID.replace(/^(.{4}).+$/, "$1…"),
-tokenTtlSeconds: Number(TWILIO_TOKEN_TTL || 3600),
-},
-});
-});
-
-/* ============================================================
-
-1. TWILIO TOKEN (VoIP)
-   ============================================================ */
-
-app.post("/api/twilio-token", (req, res) => {
-try {
-console.log("[Twilio] 🔐 Token request received...");
-
-```
-if (!TWILIO_ENABLED) {
-  console.warn("[Twilio] ❌ Not configured, rejecting.");
-  return res.status(503).json({
-    errorCode: "TWILIO_CONFIG_INCOMPLETE",
-    error:
-      "Twilio is not fully configured on the backend. Check TWILIO_* env vars.",
-  });
-}
-
-const AccessToken = twilio.jwt.AccessToken;
-const VoiceGrant = AccessToken.VoiceGrant;
-const identity = req.body?.identity || "afi-agent";
-
-const ttl = Number(TWILIO_TOKEN_TTL || 3600);
-const token = new AccessToken(
-  TWILIO_ACCOUNT_SID,
-  TWILIO_API_KEY,
-  TWILIO_API_SECRET,
-  { identity, ttl }
-);
-
-token.addGrant(
-  new VoiceGrant({
-    outgoingApplicationSid: TWILIO_TWIML_APP_SID,
-    incomingAllow: true,
+  cors({
+    origin: (origin, cb) => cb(null, true), // open cors for now (CodePen + prod). Lock later.
+    credentials: true,
   })
 );
+app.use(express.json({ limit: "2mb" }));
 
-res.json({
-  token: token.toJwt(),
-  identity,
-  accountSid: TWILIO_ACCOUNT_SID,
-  phoneNumber: TWILIO_PHONE_NUMBER || null,
-  voiceUrl: `${baseUrl}/api/voice`,
-  ttlSeconds: ttl,
+const limiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
 });
-```
+app.use(limiter);
 
-} catch (e) {
-console.error("[Twilio] ❌ Token Error:", e);
-res.status(500).json({
-errorCode: "TWILIO_TOKEN_ERROR",
-error: e.message || "Failed to generate Twilio token",
-});
-}
+// Simple request logger
+app.use((req, _res, next) => {
+  const t = new Date().toISOString();
+  console.log(`[${t}] ${req.method} ${req.path}`);
+  next();
 });
 
-/* ============================================================
-2) TWIML VOICE
-============================================================ */
+// -------------------------
+// 1) ENV VALIDATION
+// -------------------------
 
-app.post("/api/voice", (req, res) => {
-try {
-console.log("[Voice] 📞 Incoming TwiML request...");
-
-```
-const VoiceResponse = twilio.twiml.VoiceResponse;
-const response = new VoiceResponse();
-const { To } = req.body || {};
-
-if (!TWILIO_ENABLED) {
-  response.say(
-    "Le service d'appel AFI OPS n'est pas disponible pour le moment."
-  );
-  res.type("text/xml");
-  return res.send(response.toString());
+function needEnv(name, optional = false) {
+  const v = process.env[name];
+  if (!v && !optional) {
+    console.warn(`⚠️ Missing ENV: ${name}`);
+  }
+  return v || "";
 }
 
-if (To) {
-  const dial = response.dial({
-    callerId: TWILIO_PHONE_NUMBER,
-    timeout: 30,
+const PORT = process.env.PORT || 3000;
+
+// Twilio
+const TWILIO_ACCOUNT_SID = needEnv("TWILIO_ACCOUNT_SID", true);
+const TWILIO_API_KEY_SID = needEnv("TWILIO_API_KEY_SID", true);
+const TWILIO_API_KEY_SECRET = needEnv("TWILIO_API_KEY_SECRET", true);
+const TWILIO_APP_SID = needEnv("TWILIO_APP_SID", true);
+
+// Monday
+const MONDAY_API_TOKEN = needEnv("MONDAY_API_TOKEN", true);
+const MONDAY_BOARD_ID = needEnv("MONDAY_BOARD_ID", true);
+const MONDAY_GROUP_SAV = needEnv("MONDAY_GROUP_SAV", true) || "sav";
+const MONDAY_GROUP_SALES = needEnv("MONDAY_GROUP_SALES", true) || "sales";
+
+// YouTube
+const YT_API_KEY = needEnv("YT_API_KEY", true);
+
+// Outlook (Graph OAuth)
+const OUTLOOK_CLIENT_ID = needEnv("OUTLOOK_CLIENT_ID", true);
+const OUTLOOK_CLIENT_SECRET = needEnv("OUTLOOK_CLIENT_SECRET", true);
+const OUTLOOK_TENANT_ID = needEnv("OUTLOOK_TENANT_ID", true);
+const OUTLOOK_REDIRECT_URI = needEnv("OUTLOOK_REDIRECT_URI", true);
+const OUTLOOK_SCOPES =
+  needEnv("OUTLOOK_SCOPES", true) ||
+  "offline_access Mail.Read Mail.Send User.Read";
+
+// OpenAI
+const OPENAI_API_KEY = needEnv("OPENAI_API_KEY", true);
+const OPENAI_MODEL =
+  needEnv("OPENAI_MODEL", true) || "gpt-4.1-mini"; // ajuste si tu veux
+
+// Tidio
+const TIDIO_PROJECT_ID = needEnv("TIDIO_PROJECT_ID", true);
+
+// -------------------------
+// 2) HELPERS
+// -------------------------
+
+function ok(res, payload = {}) {
+  res.json({ ok: true, ...payload });
+}
+
+function fail(res, status, message, extra = {}) {
+  res.status(status).json({ ok: false, error: message, ...extra });
+}
+
+function assertBody(req, keys = []) {
+  for (const k of keys) {
+    if (req.body?.[k] == null || req.body?.[k] === "") {
+      return `Missing body field: ${k}`;
+    }
+  }
+  return null;
+}
+
+async function safeJson(res) {
+  const text = await res.text().catch(() => "");
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    return { raw: text };
+  }
+}
+
+// -------------------------
+// 3) TWILIO TOKEN
+// -------------------------
+
+app.post("/api/twilio-token", async (req, res) => {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_API_KEY_SID || !TWILIO_API_KEY_SECRET) {
+    return fail(res, 501, "Twilio env not configured");
+  }
+
+  const identity = String(req.body?.identity || "afi_agent").trim();
+
+  try {
+    const AccessToken = Twilio.jwt.AccessToken;
+    const VoiceGrant = AccessToken.VoiceGrant;
+
+    const token = new AccessToken(
+      TWILIO_ACCOUNT_SID,
+      TWILIO_API_KEY_SID,
+      TWILIO_API_KEY_SECRET,
+      { identity, ttl: 3600 }
+    );
+
+    const grant = new VoiceGrant({
+      outgoingApplicationSid: TWILIO_APP_SID || undefined,
+      incomingAllow: true,
+    });
+
+    token.addGrant(grant);
+    ok(res, { token: token.toJwt() });
+  } catch (e) {
+    console.error("[twilio-token]", e);
+    fail(res, 500, "Failed to mint Twilio token");
+  }
+});
+
+// -------------------------
+// 4) MONDAY PROXY
+// -------------------------
+
+async function mondayGraphQL(query, variables = {}) {
+  if (!MONDAY_API_TOKEN) throw new Error("Monday token missing");
+
+  const r = await fetch("https://api.monday.com/v2", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: MONDAY_API_TOKEN,
+    },
+    body: JSON.stringify({ query, variables }),
   });
 
-  if (/^[\d\+\-\(\) ]+$/.test(To)) dial.number(To);
-  else dial.client(To);
-} else {
-  response.say("Merci d'appeler AFI OPS. Aucun destinataire spécifié.");
+  const data = await safeJson(r);
+  if (!r.ok || data?.errors) {
+    const msg =
+      data?.errors?.[0]?.message ||
+      data?.error ||
+      data?.raw ||
+      `Monday HTTP ${r.status}`;
+    throw new Error(msg);
+  }
+  return data?.data;
 }
-
-res.type("text/xml");
-res.send(response.toString());
-```
-
-} catch (e) {
-console.error("[Voice] ❌ TwiML Error:", e);
-res.status(500).json({
-errorCode: "TWILIO_TWIML_ERROR",
-error: e.message || "Failed to generate TwiML",
-});
-}
-});
-
-/* ============================================================
-3) MONDAY HELPERS
-============================================================ */
-
-const MONDAY_URL = "[https://api.monday.com/v2](https://api.monday.com/v2)";
-
-function mondayHeaders() {
-if (!MONDAY_TOKEN) throw new Error("Missing MONDAY_TOKEN");
-return {
-"Content-Type": "application/json",
-Authorization: `Bearer ${MONDAY_TOKEN}`,
-"API-Version": MONDAY_API_VERSION,
-};
-}
-
-async function mondayRequest(query, variables) {
-const res = await axios.post(
-MONDAY_URL,
-{ query, variables },
-{ headers: mondayHeaders(), timeout: 15000 }
-);
-return res.data;
-}
-
-/* ============================================================
-4) MONDAY TICKETS PROXY + CACHE TTL
-============================================================ */
-
-const mondayCache = {
-data: null,
-expiresAt: 0,
-lastBoardId: null,
-lastGroupId: null,
-};
 
 app.get("/api/monday/tickets", async (req, res) => {
-console.log("[API] 📅 Fetching tickets from Monday...");
+  if (!MONDAY_BOARD_ID) {
+    return ok(res, { items: [] }); // frontend fallback demo
+  }
 
-const now = Date.now();
-const boardId = Number(req.query.boardId || DEFAULT_BOARD_ID);
-const groupId = String(req.query.groupId || DEFAULT_GROUP_ID);
+  const groupId = String(req.query.groupId || MONDAY_GROUP_SAV);
 
-if (
-mondayCache.data &&
-mondayCache.expiresAt > now &&
-mondayCache.lastBoardId === boardId &&
-mondayCache.lastGroupId === groupId
-) {
-return res.json(mondayCache.data);
-}
-
-const query = `     query ($boardId: ID!, $limit: Int!) {
-      boards(ids: [$boardId]) {
+  const query = `
+    query ($boardId: [ID!], $groupId: [String!]) {
+      boards(ids: $boardId) {
         id
-        name
-        items_page(limit: $limit) {
-          items {
-            id
-            name
-            updated_at
-            group { id title }
-            column_values { id text type value }
+        groups(ids: $groupId) {
+          id
+          title
+          items_page(limit: 50) {
+            items {
+              id
+              name
+              updated_at
+              column_values {
+                id
+                text
+                value
+                type
+              }
+            }
           }
         }
       }
-    }
- `;
-
-try {
-const data = await mondayRequest(query, {
-boardId,
-limit: MONDAY_ITEMS_LIMIT,
-});
-
-```
-if (data.errors) return res.status(400).json({ errors: data.errors });
-
-const board = data?.data?.boards?.[0];
-const rawItems = board?.items_page?.items || [];
-
-const normalized = rawItems.map((item) => {
-  const cols = item.column_values || [];
-  const colMap = {};
-  cols.forEach((col) => {
-    colMap[col.id] = {
-      id: col.id,
-      text: col.text,
-      type: col.type,
-      value: col.value,
-    };
-  });
-
-  const afi_ticket_id = toAfiTicketId(item.id);
-
-  return {
-    id: item.id,
-    afi_ticket_id,
-    name: item.name,
-    updated_at: item.updated_at,
-    group: item.group || null,
-    column_values: colMap,
-  };
-});
-
-const items =
-  groupId === "all"
-    ? normalized
-    : normalized.filter((it) => it.group?.id === groupId);
-
-const payload = { items };
-
-mondayCache.data = payload;
-mondayCache.expiresAt = now + MONDAY_TTL_MS;
-mondayCache.lastBoardId = boardId;
-mondayCache.lastGroupId = groupId;
-
-res.json(payload);
-```
-
-} catch (error) {
-console.error("[API] ❌ Monday fetch error:", error.message);
-res.status(500).json({
-error: "Failed to fetch Monday tickets",
-details: error.message,
-});
-}
-});
-
-/* ============================================================
-4.1) LOOKUP BY AFI ID OR HASH
-============================================================ */
-
-app.get("/api/monday/ticket-by-key", async (req, res) => {
-try {
-const afiId = String(req.query.afiId || "").trim();
-const hash = String(req.query.hash || "").trim();
-
-```
-if (!afiId && !hash) {
-  return res.status(400).json({ error: "afiId or hash required" });
-}
-
-const query = `
-  query ($boardId: ID!, $limit: Int!) {
-    boards(ids: [$boardId]) {
-      items_page(limit: $limit) {
-        items {
-          id
-          name
-          updated_at
-          group { id title }
-          column_values { id text type value }
-        }
-      }
-    }
-  }
-`;
-
-const data = await mondayRequest(query, {
-  boardId: DEFAULT_BOARD_ID,
-  limit: MONDAY_ITEMS_LIMIT,
-});
-
-if (data.errors) return res.status(400).json({ errors: data.errors });
-
-const rawItems = data?.data?.boards?.[0]?.items_page?.items || [];
-
-const normalized = rawItems.map((item) => {
-  const cols = item.column_values || [];
-  const colMap = {};
-  cols.forEach((col) => {
-    colMap[col.id] = col;
-  });
-  return {
-    id: item.id,
-    afi_ticket_id: toAfiTicketId(item.id),
-    name: item.name,
-    updated_at: item.updated_at,
-    group: item.group || null,
-    column_values: colMap,
-  };
-});
-
-let found = null;
-
-if (afiId) {
-  found = normalized.find(
-    (it) => it.afi_ticket_id.toLowerCase() === afiId.toLowerCase()
-  );
-}
-
-if (!found && hash) {
-  found = normalized.find((it) => {
-    const h = it.column_values?.text_mkx5q1ss?.text || "";
-    return h.includes(hash);
-  });
-}
-
-if (!found) return res.status(404).json({ error: "ticket not found" });
-
-res.json({ ok: true, ticket: found });
-```
-
-} catch (e) {
-console.error("[API] ❌ ticket-by-key failed:", e.message);
-res.status(500).json({
-ok: false,
-error: "ticket-by-key failed",
-details: e.message,
-});
-}
-});
-
-/* ============================================================
-5) MONDAY CREATE / UPSERT / RESOLVE
-============================================================ */
-
-const INTENT_MAP = {
-service: "🔧 Service",
-warranty: "🛡️ Garantie",
-parts: "🔩 Pièce",
-quote: "💰 Soumission",
-};
-const LANGUAGE_MAP = { fr: "🃏 Français", en: "🇬🇧 English" };
-
-app.post("/api/monday/create-ticket", async (req, res) => {
-console.log("[API] 🧾 Creating Monday ticket...");
-
-const boardId = Number(req.body.boardId || DEFAULT_BOARD_ID);
-const groupId = String(req.body.groupId || DEFAULT_GROUP_ID);
-
-const {
-full_name,
-phone,
-email,
-address,
-issue_description,
-intent,
-language,
-ticket_hash,
-zap_meta_timestamp,
-} = req.body || {};
-
-if (!full_name || !intent) {
-return res.status(400).json({
-error: "Missing required fields: full_name, intent",
-});
-}
-
-const mapped_intent = INTENT_MAP[intent] || intent;
-const mapped_language = LANGUAGE_MAP[language] || language;
-const item_name = `Ticket AFI – ${full_name} – ${intent}`;
-
-const column_values = {
-text_mkx51q5v: full_name || "",
-phone_mkx5xy3x: phone || "",
-email_mkx53410: email || "",
-text_mkx528gx: address || "",
-long_text_mkx59qsr: issue_description || "",
-status: mapped_intent,
-color_mkx5e9jt: mapped_language,
-date_mkx5asat:
-zap_meta_timestamp || new Date().toISOString().split("T")[0],
-text_mkx5q1ss: ticket_hash || "",
-};
-
-const mutation = `     mutation ($boardId: ID!, $groupId: String!, $itemName: String!, $cols: JSON!) {
-      create_item(
-        board_id: $boardId,
-        group_id: $groupId,
-        item_name: $itemName,
-        column_values: $cols
-      ) { id name }
     }
   `;
 
-try {
-const data = await mondayRequest(mutation, {
-boardId,
-groupId,
-itemName: item_name,
-cols: JSON.stringify(column_values),
-});
+  try {
+    const data = await mondayGraphQL(query, {
+      boardId: MONDAY_BOARD_ID,
+      groupId,
+    });
 
-```
-if (data.errors) return res.status(400).json({ errors: data.errors });
-mondayCache.data = null;
-
-const created = data?.data?.create_item;
-const afi_ticket_id = toAfiTicketId(created?.id);
-
-res.json({
-  ok: true,
-  item: created,
-  afi_ticket_id,
-  item_name,
-  column_values,
-  boardId,
-  groupId,
-});
-```
-
-} catch (e) {
-console.error("[API] ❌ Create ticket failed:", e.message);
-res.status(500).json({
-ok: false,
-error: "Failed to create Monday ticket",
-details: e.message,
-});
-}
+    const items =
+      data?.boards?.[0]?.groups?.[0]?.items_page?.items || [];
+    ok(res, { items });
+  } catch (e) {
+    console.error("[monday/tickets]", e);
+    fail(res, 500, "Monday tickets fetch failed", {
+      details: e.message,
+    });
+  }
 });
 
 app.post("/api/monday/upsert-ticket", async (req, res) => {
-console.log("[API] ♻️ Upserting Monday ticket...");
+  if (!MONDAY_BOARD_ID) return fail(res, 501, "Monday not configured");
 
-try {
-const { ticket, ticketId } = req.body || {};
-if (!ticketId && !ticket?.id) {
-return res.status(400).json({ error: "ticketId missing" });
-}
+  const err = assertBody(req, ["ticketId"]);
+  if (err) return fail(res, 400, err);
 
-```
-const itemId = String(ticket?.mondayItemId || ticketId || ticket?.id);
+  const ticketId = String(req.body.ticketId);
+  const ticket = req.body.ticket || {};
+  const groupId =
+    String(req.body.groupId || req.body.ticket?.groupId || MONDAY_GROUP_SAV);
 
-const colVals = {
-  long_text_mkx59qsr:
-    ticket?.issue_description ||
-    ticket?.problem ||
-    ticket?.raw?.long_text_mkx59qsr ||
-    "",
-};
+  // Minimal column mapping. Ajuste IDs si tu veux write des colonnes précises.
+  // Ici je pousse name + long_text "description_probleme" si dispo
+  const itemName =
+    ticket?.clientName && ticket?.topic
+      ? `${ticket.clientName} · ${ticket.topic}`
+      : ticket?.listTitle || ticketId;
 
-const mutation = `
-  mutation ($itemId: ID!, $cols: JSON!) {
-    change_multiple_column_values(
-      item_id: $itemId,
-      board_id: ${DEFAULT_BOARD_ID},
-      column_values: $cols
-    ) { id }
+  const colVals = {};
+  if (ticket?.wrap) colVals["long_text_mkx59qsr"] = ticket.wrap;
+  if (ticket?.address) colVals["text_mkx528gx"] = ticket.address;
+  if (ticket?.phone) colVals["phone_mksmhr3b"] = ticket.phone;
+  if (ticket?.email) colVals["email_mkpfc74p"] = ticket.email;
+
+  const mutationCreate = `
+    mutation ($boardId: ID!, $groupId: String!, $itemName: String!, $colVals: JSON!) {
+      create_item(board_id: $boardId, group_id: $groupId, item_name: $itemName, column_values: $colVals) {
+        id
+      }
+    }
+  `;
+
+  const mutationUpdate = `
+    mutation ($boardId: ID!, $itemId: ID!, $colVals: JSON!) {
+      change_multiple_column_values(board_id: $boardId, item_id: $itemId, column_values: $colVals) {
+        id
+      }
+    }
+  `;
+
+  try {
+    let itemId = String(req.body.mondayItemId || ticket?.mondayItemId || "");
+
+    // si itemId fourni -> update, sinon create
+    if (itemId) {
+      await mondayGraphQL(mutationUpdate, {
+        boardId: MONDAY_BOARD_ID,
+        itemId,
+        colVals: JSON.stringify(colVals),
+      });
+      ok(res, { status: "updated", itemId });
+      return;
+    }
+
+    const data = await mondayGraphQL(mutationCreate, {
+      boardId: MONDAY_BOARD_ID,
+      groupId,
+      itemName,
+      colVals: JSON.stringify(colVals),
+    });
+
+    itemId = data?.create_item?.id;
+    ok(res, { status: "created", itemId });
+  } catch (e) {
+    console.error("[monday/upsert]", e);
+    fail(res, 500, "Monday upsert failed", { details: e.message });
   }
-`;
-
-const data = await mondayRequest(mutation, {
-  itemId,
-  cols: JSON.stringify(colVals),
-});
-
-if (data.errors) return res.status(400).json({ errors: data.errors });
-mondayCache.data = null;
-
-res.json({
-  ok: true,
-  itemId,
-  afi_ticket_id: toAfiTicketId(itemId),
-  status: "updated",
-});
-```
-
-} catch (e) {
-console.error("[API] ❌ Upsert failed:", e.message);
-res.status(500).json({
-ok: false,
-error: "Failed to upsert Monday ticket",
-details: e.message,
-});
-}
 });
 
 app.post("/api/monday/resolve-ticket", async (req, res) => {
-console.log("[API] ✅ Resolving Monday ticket...");
+  if (!MONDAY_BOARD_ID) return fail(res, 501, "Monday not configured");
 
-try {
-const { ticketId, mondayItemId } = req.body || {};
-const itemId = String(mondayItemId || ticketId);
-if (!itemId) return res.status(400).json({ error: "ticketId missing" });
+  const err = assertBody(req, ["ticketId"]);
+  if (err) return fail(res, 400, err);
 
-```
-const colVals = { color_mkx55mz3: "✅ Résolu" };
+  const ticketId = String(req.body.ticketId);
+  const itemId = String(req.body.mondayItemId || ticketId);
 
-const mutation = `
-  mutation ($itemId: ID!, $cols: JSON!) {
-    change_multiple_column_values(
-      item_id: $itemId,
-      board_id: ${DEFAULT_BOARD_ID},
-      column_values: $cols
-    ) { id }
+  // Exemple: set un status "Résolu" sur colonne status principale.
+  // Ajuste "status" -> ton id de colonne.
+  const mutation = `
+    mutation ($boardId: ID!, $itemId: ID!, $status: String!) {
+      change_simple_column_value(board_id: $boardId, item_id: $itemId, column_id: "status", value: $status) {
+        id
+      }
+    }
+  `;
+
+  try {
+    await mondayGraphQL(mutation, {
+      boardId: MONDAY_BOARD_ID,
+      itemId,
+      status: JSON.stringify({ label: "Résolu" }),
+    });
+    ok(res, { itemId });
+  } catch (e) {
+    console.error("[monday/resolve]", e);
+    fail(res, 500, "Monday resolve failed", { details: e.message });
   }
-`;
-
-const data = await mondayRequest(mutation, {
-  itemId,
-  cols: JSON.stringify(colVals),
 });
 
-if (data.errors) return res.status(400).json({ errors: data.errors });
-mondayCache.data = null;
+// -------------------------
+// 5) TRANSCRIPT (RAM v1)
+// -------------------------
 
-res.json({
-  ok: true,
-  itemId,
-  afi_ticket_id: toAfiTicketId(itemId),
-  status: "resolved",
-});
-```
+let activeTranscript = {
+  sid: null,
+  text: "",
+  updatedAt: 0,
+};
 
-} catch (e) {
-console.error("[API] ❌ Resolve failed:", e.message);
-res.status(500).json({
-ok: false,
-error: "Failed to resolve Monday ticket",
-details: e.message,
-});
-}
-});
-
-/* ============================================================
-6) TRANSCRIPT ENDPOINTS (POC SAFE)
-============================================================ */
-
-app.get("/api/transcript/active", (req, res) => {
-res.status(501).json({
-ok: false,
-errorCode: "TRANSCRIPT_NOT_IMPLEMENTED",
-message: "Transcript backend not wired yet.",
-text: "",
-});
+app.get("/api/transcript/active", (_req, res) => {
+  if (!activeTranscript.text) {
+    return ok(res, { text: "" });
+  }
+  ok(res, { ...activeTranscript });
 });
 
 app.get("/api/transcript/by-sid", (req, res) => {
-res.status(501).json({
-ok: false,
-errorCode: "TRANSCRIPT_NOT_IMPLEMENTED",
-message: "Transcript backend not wired yet.",
-text: "",
-});
+  const sid = String(req.query.sid || "").trim();
+  if (!sid) return fail(res, 400, "Missing sid");
+  if (activeTranscript.sid !== sid) return ok(res, { text: "" });
+  ok(res, { ...activeTranscript });
 });
 
-/* ============================================================
-7) OUTLOOK AUTH (PKCE) + CALLBACK + STATUS + EMAILS
-============================================================ */
+// Hook futur: POST /api/transcript/ingest (Twilio webhook, STT, etc.)
+app.post("/api/transcript/ingest", (req, res) => {
+  const { sid, text } = req.body || {};
+  if (!sid || !text) return fail(res, 400, "Missing sid/text");
 
-const GRAPH_BASE = "[https://graph.microsoft.com/v1.0](https://graph.microsoft.com/v1.0)";
-const OUTLOOK_SCOPES = [
-"openid",
-"profile",
-"email",
-"offline_access",
-"Mail.Read",
-"Mail.Send",
-].join(" ");
-
-function base64UrlEncode(buffer) {
-return buffer
-.toString("base64")
-.replace(/+/g, "-")
-.replace(///g, "_")
-.replace(/=+$/, "");
-}
-
-function sha256(verifier) {
-return crypto.createHash("sha256").update(verifier).digest();
-}
-
-function buildPkcePair() {
-const verifier = base64UrlEncode(crypto.randomBytes(32));
-const challenge = base64UrlEncode(sha256(verifier));
-return { verifier, challenge, method: "S256" };
-}
-
-function getRedirectUri() {
-return (
-OUTLOOK_REDIRECT_URI ||
-`${baseUrl.replace(/\/$/, "")}/api/outlook/callback`
-);
-}
-
-function outlookConfigured() {
-return !!OUTLOOK_CLIENT_ID && !!OUTLOOK_TENANT_ID;
-}
-
-async function refreshOutlookTokenIfNeeded(req) {
-const tokens = req.session?.outlookTokens;
-if (!tokens?.refresh_token) return null;
-
-const now = Date.now();
-const obtainedAt = tokens.obtained_at || 0;
-const expiresInMs = (tokens.expires_in || 0) * 1000;
-const stillValid = obtainedAt + expiresInMs - 60_000 > now;
-
-if (stillValid && tokens.access_token) return tokens;
-
-const tokenUrl = `https://login.microsoftonline.com/${OUTLOOK_TENANT_ID}/oauth2/v2.0/token`;
-const params = new URLSearchParams({
-client_id: OUTLOOK_CLIENT_ID,
-client_secret: OUTLOOK_CLIENT_SECRET,
-grant_type: "refresh_token",
-refresh_token: tokens.refresh_token,
-redirect_uri: getRedirectUri(),
-scope: OUTLOOK_SCOPES,
-});
-
-const r = await axios.post(tokenUrl, params.toString(), {
-headers: { "Content-Type": "application/x-www-form-urlencoded" },
-timeout: 15000,
-});
-
-const newTokens = {
-...tokens,
-...r.data,
-obtained_at: Date.now(),
-};
-
-req.session.outlookTokens = newTokens;
-return newTokens;
-}
-
-app.get("/api/outlook-auth", (req, res) => {
-try {
-console.log("[Outlook] 🔐 Building OAuth URL (PKCE)...");
-
-```
-if (!outlookConfigured()) {
-  return res.status(500).json({
-    errorCode: "OUTLOOK_CONFIG_INCOMPLETE",
-    error: "Missing OUTLOOK_CLIENT_ID or OUTLOOK_TENANT_ID",
-  });
-}
-
-// Store returnUrl for UX after login (used by frontend)
-const returnUrl = String(req.query.returnUrl || "").trim();
-if (returnUrl) {
-  req.session.outlookReturnUrl = returnUrl;
-}
-
-const { verifier, challenge, method } = buildPkcePair();
-req.session.pkce = { verifier, challenge, method, created_at: Date.now() };
-
-const redirectUri = getRedirectUri();
-const authUrl =
-  `https://login.microsoftonline.com/${OUTLOOK_TENANT_ID}` +
-  `/oauth2/v2.0/authorize?client_id=${OUTLOOK_CLIENT_ID}` +
-  `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-  `&response_type=code` +
-  `&response_mode=query` +
-  `&scope=${encodeURIComponent(OUTLOOK_SCOPES)}` +
-  `&code_challenge=${challenge}` +
-  `&code_challenge_method=${method}`;
-
-if (req.query.redirect === "1") {
-  return res.redirect(authUrl);
-}
-
-return res.json({ url: authUrl });
-```
-
-} catch (e) {
-console.error("[Outlook] auth error:", e.message);
-res.status(500).json({ error: e.message });
-}
-});
-
-app.get("/api/outlook/callback", async (req, res) => {
-try {
-const { code, error, error_description } = req.query;
-
-```
-if (error) {
-  return res
-    .status(400)
-    .send(
-      `<h1>Outlook - Erreur</h1><p>${error_description || error}</p>`
-    );
-}
-if (!code) {
-  return res.status(400).send("<h1>Outlook - Code manquant</h1>");
-}
-if (!OUTLOOK_CLIENT_ID || !OUTLOOK_CLIENT_SECRET || !OUTLOOK_TENANT_ID) {
-  return res
-    .status(500)
-    .send("<h1>Outlook non configuré côté backend.</h1>");
-}
-
-const pkceVerifier = req.session?.pkce?.verifier;
-if (!pkceVerifier) {
-  return res
-    .status(400)
-    .send("<h1>PKCE verifier manquant. Recommence le login.</h1>");
-}
-
-const tokenUrl = `https://login.microsoftonline.com/${OUTLOOK_TENANT_ID}/oauth2/v2.0/token`;
-const params = new URLSearchParams({
-  client_id: OUTLOOK_CLIENT_ID,
-  client_secret: OUTLOOK_CLIENT_SECRET,
-  grant_type: "authorization_code",
-  code,
-  redirect_uri: getRedirectUri(),
-  code_verifier: pkceVerifier,
-  scope: OUTLOOK_SCOPES,
-});
-
-const tokenRes = await axios.post(tokenUrl, params.toString(), {
-  headers: { "Content-Type": "application/x-www-form-urlencoded" },
-  timeout: 15000,
-});
-
-const rawTokens = {
-  ...tokenRes.data,
-  obtained_at: Date.now(),
-};
-
-let account = null;
-try {
-  const meRes = await axios.get(`${GRAPH_BASE}/me`, {
-    headers: { Authorization: `Bearer ${rawTokens.access_token}` },
-    timeout: 12000,
-  });
-  const me = meRes.data || {};
-  account = {
-    displayName: me.displayName || "",
-    mail: me.mail || me.userPrincipalName || "",
-    userPrincipalName: me.userPrincipalName || "",
+  activeTranscript = {
+    sid: String(sid),
+    text: String(text),
+    updatedAt: Date.now(),
   };
-} catch (profileErr) {
-  console.warn(
-    "[Outlook] ⚠️ Cannot fetch /me profile:",
-    profileErr.message
-  );
-  account = { displayName: "", mail: "", userPrincipalName: "" };
-}
-
-req.session.outlookTokens = { ...rawTokens, account };
-req.session.pkce = null;
-
-const returnUrl = req.session.outlookReturnUrl || "";
-
-res.send(`
-  <html>
-    <body style="background:#020617;color:#e5e7eb;font-family:-apple-system,system-ui;padding:32px">
-      <h1>Outlook connecté ✅</h1>
-      <p>Tu peux fermer cette fenêtre et revenir à AFI OPS Cockpit.</p>
-
-      ${
-        returnUrl
-          ? `<p><a href="${returnUrl}" style="color:#60a5fa">↩ Retour au cockpit</a></p>`
-          : ""
-      }
-
-      <script>
-        try {
-          if (window.opener) {
-            window.opener.postMessage({ type: "outlook_oauth_done" }, "*");
-            window.opener.postMessage({ type: "OUTLOOK_CONNECTED" }, "*");
-            window.close();
-          }
-        } catch (e) {}
-      </script>
-    </body>
-  </html>
-`);
-```
-
-} catch (e) {
-console.error("[Outlook] callback error:", e.message);
-res
-.status(500)
-.send("<h1>Erreur lors de la récupération du token Outlook.</h1>");
-}
+  ok(res, { stored: true });
 });
 
-app.get("/api/outlook-status", async (req, res) => {
-try {
-if (!outlookConfigured()) {
-return res.json({ connected: false, reason: "not_configured" });
-}
+// -------------------------
+// 6) YOUTUBE SEARCH PROXY
+// -------------------------
 
-```
-const tokens = await refreshOutlookTokenIfNeeded(req);
-if (!tokens?.access_token) return res.json({ connected: false });
+app.get("/api/youtube/search", async (req, res) => {
+  if (!YT_API_KEY) return fail(res, 501, "YT env not configured");
 
-const account = tokens.account || {
-  displayName: "",
-  mail: "",
-  userPrincipalName: "",
-};
+  const q = String(req.query.q || "").trim();
+  if (!q) return ok(res, { items: [] });
 
-return res.json({
-  connected: true,
-  account: {
-    displayName: account.displayName,
-    mail: account.mail || account.userPrincipalName,
-  },
-});
-```
+  try {
+    const url =
+      "https://www.googleapis.com/youtube/v3/search" +
+      `?part=snippet&type=video&maxResults=8&q=${encodeURIComponent(q)}` +
+      `&key=${encodeURIComponent(YT_API_KEY)}`;
 
-} catch (e) {
-console.error("[Outlook] status error:", e.message);
-res.status(500).json({ connected: false, error: e.message });
-}
-});
+    const r = await fetch(url);
+    const data = await safeJson(r);
 
-async function handleOutlookEmails(req, res) {
-try {
-if (!outlookConfigured()) {
-return res.status(500).json({
-errorCode: "OUTLOOK_NOT_CONFIGURED",
-error: "Outlook env vars missing.",
-items: [],
-});
-}
-
-```
-const tokens = await refreshOutlookTokenIfNeeded(req);
-if (!tokens?.access_token) {
-  return res.status(401).json({
-    errorCode: "OUTLOOK_NOT_CONNECTED",
-    error: "No Outlook session token found. Call /api/outlook-auth first.",
-    items: [],
-  });
-}
-
-const clientEmail = String(req.query.email || "").trim();
-const ticketId = String(req.query.ticketId || "").trim();
-
-const filters = [];
-
-if (ticketId) {
-  const safeTicket = ticketId.replace(/'/g, "''");
-  filters.push(`contains(subject,'${safeTicket}')`);
-}
-
-if (clientEmail) {
-  const safeEmail = clientEmail.replace(/'/g, "''");
-  filters.push(
-    `(from/emailAddress/address eq '${safeEmail}' or toRecipients/any(r:r/emailAddress/address eq '${safeEmail}'))`
-  );
-}
-
-const params = new URLSearchParams({
-  $top: "20",
-  $select: "subject,from,receivedDateTime,bodyPreview,webLink",
-  $orderby: "receivedDateTime desc",
-});
-if (filters.length > 0) params.set("$filter", filters.join(" and "));
-
-const url = `${GRAPH_BASE}/me/messages?${params.toString()}`;
-
-const graphRes = await axios.get(url, {
-  headers: { Authorization: `Bearer ${tokens.access_token}` },
-  timeout: 15000,
-});
-
-const items = (graphRes.data?.value || []).map((m) => {
-  const fromName =
-    m?.from?.emailAddress?.name ||
-    m?.from?.emailAddress?.address ||
-    "";
-  return {
-    id: m.id,
-    subject: m.subject || "",
-    from: fromName,
-    preview: m.bodyPreview || "",
-    receivedAt: m.receivedDateTime || "",
-    link: m.webLink || "",
-  };
-});
-
-return res.json(items);
-```
-
-} catch (e) {
-console.error("[Outlook] emails error:", e.message);
-res.status(500).json({
-errorCode: "OUTLOOK_MESSAGES_ERROR",
-error: e.message || "Failed to fetch Outlook messages",
-items: [],
-});
-}
-}
-
-app.get("/api/outlook-emails", handleOutlookEmails);
-app.get("/api/outlook-messages", handleOutlookEmails);
-
-/* ============================================================
-8) TIDIO CONFIG
-============================================================ */
-
-app.get("/api/tidio-config", (req, res) => {
-try {
-if (!TIDIO_PROJECT_ID) {
-return res.status(500).json({
-errorCode: "TIDIO_CONFIG_INCOMPLETE",
-error: "Missing TIDIO_PROJECT_ID",
-});
-}
-res.json({ projectId: TIDIO_PROJECT_ID });
-} catch (e) {
-res.status(500).json({ error: e.message });
-}
-});
-
-/* ============================================================
-9) YOUTUBE SEARCH (widget)
-============================================================ */
-
-const YT_CACHE_TTL_MS = 60_000;
-const ytCache = new Map();
-
-async function handleYoutubeSearch(req, res) {
-try {
-const q = String(req.query.q || "").trim();
-if (!q) return res.json({ items: [] });
-
-```
-if (!YOUTUBE_API_KEY) {
-  return res.status(503).json({
-    errorCode: "YOUTUBE_KEY_MISSING",
-    error: "Missing YOUTUBE_API_KEY in backend env.",
-    items: [],
-  });
-}
-
-const cacheKey = q.toLowerCase();
-const now = Date.now();
-const cached = ytCache.get(cacheKey);
-
-if (cached && cached.expiresAt > now) {
-  return res.json({ items: cached.items, cached: true });
-}
-
-const url = new URL("https://www.googleapis.com/youtube/v3/search");
-url.searchParams.set("part", "snippet");
-url.searchParams.set("type", "video");
-url.searchParams.set("maxResults", "8");
-url.searchParams.set("q", q);
-url.searchParams.set("key", YOUTUBE_API_KEY);
-url.searchParams.set("safeSearch", "strict");
-
-const r = await axios.get(url.toString(), { timeout: 12000 });
-const data = r.data || {};
-
-const items = (data.items || [])
-  .map((x) => {
-    const id = x?.id?.videoId;
-    const sn = x?.snippet || {};
-    if (!id) return null;
-
-    return {
-      id,
-      title: sn.title || "Video",
-      thumb:
-        sn.thumbnails?.medium?.url ||
-        sn.thumbnails?.default?.url ||
+    const items = (data.items || []).map((it) => ({
+      videoId: it.id?.videoId,
+      title: it.snippet?.title || "Video",
+      thumbnail:
+        it.snippet?.thumbnails?.medium?.url ||
+        it.snippet?.thumbnails?.default?.url ||
         "",
-      channelTitle: sn.channelTitle || "",
-      publishedAt: sn.publishedAt || "",
-    };
-  })
-  .filter(Boolean);
+    })).filter(x => x.videoId);
 
-ytCache.set(cacheKey, {
-  items,
-  expiresAt: now + YT_CACHE_TTL_MS,
+    ok(res, { items });
+  } catch (e) {
+    console.error("[youtube/search]", e);
+    fail(res, 500, "YouTube search failed");
+  }
 });
 
-res.json({ items });
-```
+// -------------------------
+// 7) OUTLOOK (Graph OAuth v1)
+// -------------------------
 
-} catch (e) {
-console.error("[YouTube] search error:", e.message);
-res.status(500).json({
-errorCode: "YOUTUBE_SEARCH_ERROR",
-error: e.message || "YouTube search failed",
-items: [],
-});
-}
-}
+let outlookTokenStore = {
+  accessToken: "",
+  refreshToken: "",
+  expiresAt: 0,
+};
 
-// Route principale utilisée par le front actuel
-app.get("/api/youtube/search", handleYoutubeSearch);
-
-// Alias routes pour l'ancien front si besoin
-app.get("/api/youtube-search", handleYoutubeSearch);
-
-// Alias Outlook pour compatibilité legacy
-app.get("/api/outlook/auth-url", (req, res) =>
-res.redirect("/api/outlook-auth")
-);
-app.get("/api/outlook/messages", handleOutlookEmails);
-
-/* ============================================================
-11) GPT HELPERS (stubs pour Console Live)
-
-* /api/gpt/analyze-ticket
-* /api/gpt/generate-wrap
-  ============================================================ */
-
-function summarizeWrapText(raw) {
-const txt = String(raw || "").replace(/\s+/g, " ").trim();
-if (!txt) return "Aucun wrap fourni.";
-const max = 260;
-const short = txt.length > max ? txt.slice(0, max - 1) + "…" : txt;
-return `Résumé technique (stub) : ${short}`;
+function isOutlookConnected() {
+  return (
+    outlookTokenStore.accessToken &&
+    outlookTokenStore.expiresAt > Date.now() + 30_000
+  );
 }
 
-function normalizeWrap(raw) {
-const txt = String(raw || "").trim();
-if (!txt) {
-return [
-"AFI • Wrap SAV (généré côté backend – stub)",
-"",
-"- Client : N/D",
-"- Problème : N/D",
-"",
-"Prochaine étape : compléter ce wrap dans GPT (Console AFI) quand le backend LLM sera branché.",
-].join("\n");
+function outlookAuthUrl() {
+  const tenant = OUTLOOK_TENANT_ID || "common";
+  const params = new URLSearchParams({
+    client_id: OUTLOOK_CLIENT_ID,
+    response_type: "code",
+    redirect_uri: OUTLOOK_REDIRECT_URI,
+    response_mode: "query",
+    scope: OUTLOOK_SCOPES,
+    prompt: "select_account",
+  });
+  return `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/authorize?${params.toString()}`;
 }
 
-const lines = txt.split(/\r?\n/).map((l) => l.trim());
-const nonEmpty = lines.filter(Boolean);
+async function exchangeOutlookCode(code) {
+  const tenant = OUTLOOK_TENANT_ID || "common";
+  const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
 
-// Ajout d'un header AFI si absent
-const header =
-nonEmpty[0] && /afi/i.test(nonEmpty[0])
-? nonEmpty[0]
-: "AFI • Wrap SAV (normalisé – stub)";
+  const body = new URLSearchParams({
+    client_id: OUTLOOK_CLIENT_ID,
+    client_secret: OUTLOOK_CLIENT_SECRET,
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: OUTLOOK_REDIRECT_URI,
+    scope: OUTLOOK_SCOPES,
+  });
 
-const body = nonEmpty.slice(1);
-return [header, "", ...body].join("\n");
+  const r = await fetch(tokenUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  const data = await safeJson(r);
+  if (!r.ok) throw new Error(data?.error_description || "token exchange failed");
+
+  outlookTokenStore = {
+    accessToken: data.access_token || "",
+    refreshToken: data.refresh_token || "",
+    expiresAt: Date.now() + (data.expires_in || 0) * 1000,
+  };
+  return outlookTokenStore;
 }
 
-app.post("/api/gpt/analyze-ticket", (req, res) => {
-try {
-const wrapText = req.body?.wrapText || "";
-if (!wrapText || !String(wrapText).trim()) {
-return res.status(400).json({
-ok: false,
-errorCode: "MISSING_WRAP",
-error: "wrapText is required",
+app.get("/api/outlook-status", (_req, res) => {
+  ok(res, {
+    connected: isOutlookConnected(),
+    expiresInSeconds: outlookTokenStore.expiresAt
+      ? Math.max(0, Math.floor((outlookTokenStore.expiresAt - Date.now()) / 1000))
+      : 0,
+  });
 });
+
+// Le front ouvre authUrl dans une popup
+app.post("/api/outlook-auth", (_req, res) => {
+  if (!OUTLOOK_CLIENT_ID || !OUTLOOK_REDIRECT_URI) {
+    return fail(res, 501, "Outlook env not configured");
+  }
+  ok(res, { authUrl: outlookAuthUrl() });
+});
+
+// Callback OAuth (à mettre dans ton redirect uri)
+app.get("/api/outlook-callback", async (req, res) => {
+  const code = String(req.query.code || "").trim();
+  if (!code) return fail(res, 400, "Missing code");
+
+  try {
+    await exchangeOutlookCode(code);
+
+    // Poke le parent window (popup -> CodePen/prod)
+    res.send(`
+      <script>
+        window.opener && window.opener.postMessage({ type: "OUTLOOK_CONNECTED" }, "*");
+        window.close();
+      </script>
+      <p>Outlook connecté. Tu peux fermer cette fenêtre.</p>
+    `);
+  } catch (e) {
+    console.error("[outlook/callback]", e);
+    res.send(`<p>Erreur OAuth Outlook: ${e.message}</p>`);
+  }
+});
+
+// -------------------------
+// 8) GPT BACKEND (OpenAI proxy)
+// -------------------------
+
+async function openaiChat(messages, temperature = 0.2) {
+  if (!OPENAI_API_KEY) throw new Error("OpenAI env missing");
+
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      messages,
+      temperature,
+    }),
+  });
+
+  const data = await safeJson(r);
+  if (!r.ok) {
+    throw new Error(data?.error?.message || "OpenAI HTTP error");
+  }
+  return data?.choices?.[0]?.message?.content || "";
 }
 
-```
-const summary = summarizeWrapText(wrapText);
+app.post("/api/gpt/analyze-ticket", async (req, res) => {
+  const wrapText = String(req.body?.wrapText || "").trim();
 
-res.json({
-  ok: true,
-  summary,
-  // Petit debug utile dans la console si besoin
-  meta: {
-    length: String(wrapText).length,
-  },
-});
-```
+  try {
+    const content = await openaiChat([
+      {
+        role: "system",
+        content:
+          "Tu es l'assistant AFI OPS. Analyse un wrap SAV et retourne un résumé actionnable en FR-CA.",
+      },
+      {
+        role: "user",
+        content: wrapText || "(wrap vide)",
+      },
+    ]);
 
-} catch (e) {
-console.error("[GPT STUB] analyze-ticket error:", e.message);
-res.status(500).json({
-ok: false,
-errorCode: "ANALYZE_TICKET_ERROR",
-error: e.message || "Failed to analyze ticket (stub)",
-});
-}
-});
-
-app.post("/api/gpt/generate-wrap", (req, res) => {
-try {
-const wrapText = req.body?.wrapText || "";
-const wrap = normalizeWrap(wrapText);
-
-```
-res.json({
-  ok: true,
-  wrap,
-});
-```
-
-} catch (e) {
-console.error("[GPT STUB] generate-wrap error:", e.message);
-res.status(500).json({
-ok: false,
-errorCode: "GENERATE_WRAP_ERROR",
-error: e.message || "Failed to generate wrap (stub)",
-});
-}
+    ok(res, { summary: content });
+  } catch (e) {
+    console.error("[gpt/analyze-ticket]", e);
+    fail(res, 500, "GPT analyze failed", { details: e.message });
+  }
 });
 
-/* ============================================================
-12) ERROR HANDLING
-============================================================ */
+app.post("/api/gpt/generate-wrap", async (req, res) => {
+  const wrapText = String(req.body?.wrapText || "").trim();
 
-app.use((err, req, res, next) => {
-console.error("[Error]", err);
-res.status(500).json({
-error: "Internal server error",
-details: err.message,
-});
+  try {
+    const content = await openaiChat(
+      [
+        {
+          role: "system",
+          content:
+            "Tu es l'assistant AFI OPS. Transforme des notes brutes en WRAP SAV clair, structuré, avec étapes, modèle/série, urgence. FR-CA.",
+        },
+        {
+          role: "user",
+          content: wrapText || "(notes vides)",
+        },
+      ],
+      0.35
+    );
+
+    ok(res, { wrap: content });
+  } catch (e) {
+    console.error("[gpt/generate-wrap]", e);
+    fail(res, 500, "GPT wrap failed", { details: e.message });
+  }
 });
 
-/* ============================================================
-13) START SERVER
-============================================================ */
+// -------------------------
+// 9) TIDIO CONFIG
+// -------------------------
+
+app.get("/api/tidio-config", (_req, res) => {
+  ok(res, { projectId: TIDIO_PROJECT_ID || "" });
+});
+
+// -------------------------
+// 10) HEALTHCHECK
+// -------------------------
+
+app.get("/", (_req, res) => {
+  res.send("AFI OPS backend OK");
+});
+
+// -------------------------
+// 11) GLOBAL ERROR HANDLER
+// -------------------------
+
+app.use((err, _req, res, _next) => {
+  console.error("[unhandled]", err);
+  fail(res, 500, "Server error", { details: err?.message });
+});
+
+// -------------------------
+// 12) START
+// -------------------------
 
 app.listen(PORT, () => {
-console.log(`✅ Backend running on port ${PORT}`);
-console.log(`📍 URL: ${baseUrl}`);
-console.log(`📞 TwiML Voice URL: ${baseUrl}/api/voice`);
-console.log(`📧 Outlook callback URL: ${baseUrl}/api/outlook/callback`);
+  console.log(`🚀 AFI OPS backend listening on ${PORT}`);
 });
