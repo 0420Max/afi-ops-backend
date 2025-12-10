@@ -29,7 +29,45 @@ const cors = require("cors");
 require("dotenv").config();
 
 const app = express();
-app.use(cors());
+
+/* ============================================================
+   0) CORS FIX (credentials: include côté front)
+   - PAS de "*"
+   - origins exactes/whitelistées
+   - credentials true
+============================================================ */
+const ALLOWED_ORIGINS = [
+  "https://cdpn.io",
+  "https://codepen.io",
+  "https://your-prod-domain.com",
+];
+
+const corsOptions = {
+  origin: function (origin, cb) {
+    // allow no-origin (curl/postman/health checks) too
+    if (!origin) return cb(null, true);
+
+    // allow exact matches
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+
+    // allow CodePen subdomains if any (safety net)
+    const isCodepen =
+      origin.endsWith(".cdpn.io") ||
+      origin.endsWith(".codepen.io") ||
+      origin === "https://cdpn.io" ||
+      origin === "https://codepen.io";
+
+    if (isCodepen) return cb(null, true);
+
+    return cb(new Error("CORS blocked: " + origin));
+  },
+  credentials: true,
+};
+
+app.use(cors(corsOptions));
+// Preflight support for all routes
+app.options("*", cors(corsOptions));
+
 app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 10000;
