@@ -31,41 +31,37 @@ require("dotenv").config();
 const app = express();
 
 /* ============================================================
-   0) CORS FIX (credentials: include côté front)
+   0) CORS FIX (obligatoire)
+   - credentials: "include" côté front => origin explicite
    - PAS de "*"
-   - origins exactes/whitelistées
-   - credentials true
+   - CodePen + Prod domain
 ============================================================ */
-const ALLOWED_ORIGINS = [
+const allowedOrigins = [
   "https://cdpn.io",
   "https://codepen.io",
-  "https://your-prod-domain.com",
+  "https://afi-ops.ca", // prod
 ];
 
 const corsOptions = {
   origin: function (origin, cb) {
-    // allow no-origin (curl/postman/health checks) too
+    // allow no-origin (curl/postman/server-to-server)
     if (!origin) return cb(null, true);
 
-    // allow exact matches
-    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    // allow exact whitelisted origins
+    if (allowedOrigins.includes(origin)) return cb(null, true);
 
-    // allow CodePen subdomains if any (safety net)
-    const isCodepen =
-      origin.endsWith(".cdpn.io") ||
-      origin.endsWith(".codepen.io") ||
-      origin === "https://cdpn.io" ||
-      origin === "https://codepen.io";
+    // safety net for CodePen subdomains (rare mais arrive)
+    const isCodepenSubdomain =
+      origin.endsWith(".cdpn.io") || origin.endsWith(".codepen.io");
+    if (isCodepenSubdomain) return cb(null, true);
 
-    if (isCodepen) return cb(null, true);
-
-    return cb(new Error("CORS blocked: " + origin));
+    return cb(new Error("Not allowed by CORS: " + origin), false);
   },
   credentials: true,
 };
 
 app.use(cors(corsOptions));
-// Preflight support for all routes
+// Ensure preflight works everywhere
 app.options("*", cors(corsOptions));
 
 app.use(express.json({ limit: "1mb" }));
@@ -118,10 +114,8 @@ const TWILIO_ENABLED =
 
 /* ============================================================
    OUTLOOK TOKEN STORE (in-memory)
-   - En prod: idéalement persister (DB/Redis).
 ============================================================ */
 const outlookTokens = { default: null };
-
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 
 /* ============================================================
@@ -292,7 +286,6 @@ app.get("/api/twilio/health", (req, res) => {
 
 /* ============================================================
    1) TWILIO TOKEN (VoIP)
-   POST /api/twilio-token
 ============================================================ */
 app.post("/api/twilio-token", (req, res) => {
   try {
@@ -345,7 +338,6 @@ app.post("/api/twilio-token", (req, res) => {
 
 /* ============================================================
    2) TWIML VOICE
-   POST /api/voice
 ============================================================ */
 app.post("/api/voice", (req, res) => {
   try {
@@ -411,7 +403,6 @@ async function mondayRequest(query, variables) {
 
 /* ============================================================
    4) MONDAY TICKETS PROXY + CACHE TTL
-   GET /api/monday/tickets
 ============================================================ */
 const mondayCache = {
   data: null,
@@ -835,7 +826,6 @@ app.get("/api/outlook-status", (req, res) => {
 
 /* ============================================================
    7.1) OUTLOOK FOLDERS
-   GET /api/outlook/folders
 ============================================================ */
 app.get("/api/outlook/folders", async (req, res) => {
   try {
@@ -847,9 +837,7 @@ app.get("/api/outlook/folders", async (req, res) => {
       });
     }
 
-    const data = await graphGet("/me/mailFolders", {
-      $top: "50",
-    });
+    const data = await graphGet("/me/mailFolders", { $top: "50" });
 
     const folders = (data.value || []).map((f) => ({
       id: f.id,
@@ -871,7 +859,6 @@ app.get("/api/outlook/folders", async (req, res) => {
 
 /* ============================================================
    7.2) OUTLOOK MESSAGES
-   GET /api/outlook/messages?folderId=...&top=5
 ============================================================ */
 app.get("/api/outlook/messages", async (req, res) => {
   try {
@@ -886,7 +873,6 @@ app.get("/api/outlook/messages", async (req, res) => {
     const folderId = String(req.query.folderId || "inbox");
     const top = Number(req.query.top || 10);
 
-    // Special case for inbox alias
     let path = "/me/mailFolders/inbox/messages";
     if (folderId !== "inbox") path = `/me/mailFolders/${folderId}/messages`;
 
@@ -925,8 +911,6 @@ app.get("/api/outlook/messages", async (req, res) => {
 
 /* ============================================================
    7.3) OUTLOOK SEND EMAIL
-   POST /api/outlook/send
-   body: { to, subject, content, cc?, bcc? }
 ============================================================ */
 app.post("/api/outlook/send", async (req, res) => {
   try {
@@ -983,8 +967,6 @@ app.post("/api/outlook/send", async (req, res) => {
 
 /* ============================================================
    8) ZAPIER SMS PROXY (ANTI-CORS)
-   POST /api/zapier/sms
-   body: { to, message, meta? }
 ============================================================ */
 app.post("/api/zapier/sms", async (req, res) => {
   try {
@@ -1041,9 +1023,6 @@ app.get("/api/tidio-config", (req, res) => {
 
 /* ============================================================
    10) YOUTUBE SEARCH (widget)
-   ✅ Routes:
-   - GET /api/youtube/search?q=...
-   - GET /api/youtube-search?q=... (alias compat front)
 ============================================================ */
 const YT_CACHE_TTL_MS = 60_000;
 const ytCache = new Map();
