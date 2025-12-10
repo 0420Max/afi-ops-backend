@@ -12,8 +12,9 @@
  * ✅ Transcript endpoints (POC safe, return 501 if not wired)
  * ✅ YouTube Search proxy (widget)
  * ✅ Outlook OAuth URL helper + callback + status
- * ✅ Outlook Graph API: folders, messages, send mail (refresh auto)
- * ✅ Zapier SMS proxy (optionnel, anti-CORS)
+ * ✅ Outlook Folders + Messages + Send (Graph API)
+ * ✅ Token refresh auto (offline_access)
+ * ✅ Zapier SMS proxy backend (anti-CORS)
  * ✅ Tidio config helper
  *
  * IMPORTANT:
@@ -61,8 +62,7 @@ const {
   TWILIO_TOKEN_TTL,
   YOUTUBE_API_KEY,
 
-  // Optionnel: pour proxy SMS Zapier (anti-CORS)
-  ZAPIER_SMS_WEBHOOK_URL,
+  ZAPIER_SMS_WEBHOOK_URL, // optional but useful (anti-CORS)
 } = process.env;
 
 const MONDAY_TTL_MS = Number(MONDAY_TTL_MS_ENV || 25000);
@@ -79,12 +79,10 @@ const TWILIO_ENABLED =
   !!TWILIO_TWIML_APP_SID;
 
 /* ============================================================
-   OUTLOOK TOKEN STORE (in-memory POC)
-   - Pour prod: à persister (Redis/DB). Mais ok pour cockpit v0.
+   OUTLOOK TOKEN STORE (in-memory)
+   - En prod: idéalement persister (DB/Redis).
 ============================================================ */
-const outlookTokens = {
-  default: null,
-};
+const outlookTokens = { default: null };
 
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 
@@ -116,7 +114,7 @@ console.log("ENV vars loaded:", {
 
   TIDIO_PROJECT_ID: TIDIO_PROJECT_ID ? "✓" : "✗",
   YOUTUBE_API_KEY: YOUTUBE_API_KEY ? "✓" : "✗",
-  ZAPIER_SMS_WEBHOOK_URL: ZAPIER_SMS_WEBHOOK_URL ? "✓" : "optional",
+  ZAPIER_SMS_WEBHOOK_URL: ZAPIER_SMS_WEBHOOK_URL ? "✓" : "optional empty",
 
   TWILIO_TOKEN_TTL: TWILIO_TOKEN_TTL
     ? `✓ (${TWILIO_TOKEN_TTL}s)`
@@ -130,6 +128,85 @@ if (!TWILIO_ENABLED) {
 }
 
 /* ============================================================
+   HELPERS OUTLOOK
+============================================================ */
+function isOutlookConfigured() {
+  return !!OUTLOOK_CLIENT_ID && !!OUTLOOK_TENANT_ID && !!OUTLOOK_CLIENT_SECRET;
+}
+
+function outlookRedirectUri() {
+  return (
+    OUTLOOK_REDIRECT_URI ||
+    `${baseUrl.replace(/\/$/, "")}/api/outlook/callback`
+  );
+}
+
+function tokensExpired(tokens) {
+  if (!tokens?.obtained_at || !tokens?.expires_in) return true;
+  const expiryMs = tokens.obtained_at + tokens.expires_in * 1000;
+  return Date.now() > expiryMs - 30_000; // refresh 30s early
+}
+
+async function refreshOutlookToken() {
+  const tokens = outlookTokens.default;
+  if (!tokens?.refresh_token) throw new Error("No refresh_token available");
+
+  const tokenUrl = `https://login.microsoftonline.com/${OUTLOOK_TENANT_ID}/oauth2/v2.0/token`;
+
+  const params = new URLSearchParams({
+    client_id: OUTLOOK_CLIENT_ID,
+    client_secret: OUTLOOK_CLIENT_SECRET,
+    grant_type: "refresh_token",
+    refresh_token: tokens.refresh_token,
+    redirect_uri: outlookRedirectUri(),
+    scope: "User.Read Mail.Read Mail.Send offline_access",
+  });
+
+  const r = await axios.post(tokenUrl, params.toString(), {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    timeout: 15000,
+  });
+
+  outlookTokens.default = {
+    ...r.data,
+    obtained_at: Date.now(),
+  };
+
+  return outlookTokens.default;
+}
+
+async function getValidAccessToken() {
+  if (!outlookTokens.default) throw new Error("OUTLOOK_NOT_CONNECTED");
+  if (tokensExpired(outlookTokens.default)) {
+    return (await refreshOutlookToken()).access_token;
+  }
+  return outlookTokens.default.access_token;
+}
+
+async function graphGet(path, params = {}) {
+  const token = await getValidAccessToken();
+  const url = new URL(GRAPH_BASE + path);
+  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+  const r = await axios.get(url.toString(), {
+    headers: { Authorization: `Bearer ${token}` },
+    timeout: 15000,
+  });
+  return r.data;
+}
+
+async function graphPost(path, body) {
+  const token = await getValidAccessToken();
+  const r = await axios.post(GRAPH_BASE + path, body, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    timeout: 15000,
+  });
+  return r.data;
+}
+
+/* ============================================================
    0) HEALTH CHECK
 ============================================================ */
 app.get("/", (req, res) => {
@@ -140,16 +217,14 @@ app.get("/", (req, res) => {
     services: {
       twilio: TWILIO_ENABLED ? "ready" : "disabled",
       monday: !!MONDAY_TOKEN ? "ready" : "missing_token",
-      outlook:
-        OUTLOOK_CLIENT_ID && OUTLOOK_TENANT_ID
-          ? outlookTokens.default
-            ? "connected"
-            : "configured_not_connected"
-          : "not_configured",
+      outlook: isOutlookConfigured()
+        ? outlookTokens.default
+          ? "connected"
+          : "configured_not_connected"
+        : "not_configured",
       tidio: !!TIDIO_PROJECT_ID ? "ready" : "not_configured",
       youtube: !!YOUTUBE_API_KEY ? "ready" : "missing_key",
       transcript: "poc_safe",
-      zapierSmsProxy: ZAPIER_SMS_WEBHOOK_URL ? "ready" : "not_configured",
     },
   });
 });
@@ -395,8 +470,7 @@ app.get("/api/monday/tickets", async (req, res) => {
 });
 
 /* ============================================================
-   5) MONDAY CREATE TICKET (Paperform -> topics)
-   POST /api/monday/create-ticket
+   5) MONDAY CREATE / UPSERT / RESOLVE
 ============================================================ */
 const INTENT_MAP = {
   service: "🔧 Service",
@@ -490,10 +564,6 @@ app.post("/api/monday/create-ticket", async (req, res) => {
   }
 });
 
-/* ============================================================
-   5.1) MONDAY UPSERT TICKET (front -> Monday)
-   POST /api/monday/upsert-ticket
-============================================================ */
 app.post("/api/monday/upsert-ticket", async (req, res) => {
   console.log("[API] ♻️ Upserting Monday ticket...");
 
@@ -547,10 +617,6 @@ app.post("/api/monday/upsert-ticket", async (req, res) => {
   }
 });
 
-/* ============================================================
-   5.2) MONDAY RESOLVE TICKET (front -> Monday)
-   POST /api/monday/resolve-ticket
-============================================================ */
 app.post("/api/monday/resolve-ticket", async (req, res) => {
   console.log("[API] ✅ Resolving Monday ticket...");
 
@@ -619,118 +685,29 @@ app.get("/api/transcript/by-sid", (req, res) => {
 });
 
 /* ============================================================
-   7) OUTLOOK OAUTH + GRAPH HELPERS
-============================================================ */
-function outlookConfigured() {
-  return !!OUTLOOK_CLIENT_ID && !!OUTLOOK_TENANT_ID;
-}
-
-function outlookRedirectUri() {
-  return (
-    OUTLOOK_REDIRECT_URI ||
-    `${baseUrl.replace(/\/$/, "")}/api/outlook/callback`
-  );
-}
-
-function isTokenExpired(tokens) {
-  if (!tokens?.expires_in || !tokens?.obtained_at) return true;
-  const expiresAt = tokens.obtained_at + tokens.expires_in * 1000;
-  // marge de 60 sec
-  return Date.now() > expiresAt - 60_000;
-}
-
-async function refreshOutlookToken() {
-  const tokens = outlookTokens.default;
-  if (!tokens?.refresh_token) {
-    throw new Error("No refresh_token. Reconnect Outlook.");
-  }
-
-  const tokenUrl = `https://login.microsoftonline.com/${OUTLOOK_TENANT_ID}/oauth2/v2.0/token`;
-
-  const params = new URLSearchParams({
-    client_id: OUTLOOK_CLIENT_ID,
-    client_secret: OUTLOOK_CLIENT_SECRET,
-    grant_type: "refresh_token",
-    refresh_token: tokens.refresh_token,
-    redirect_uri: outlookRedirectUri(),
-    scope: "https://graph.microsoft.com/.default offline_access",
-  });
-
-  const tokenRes = await axios.post(tokenUrl, params.toString(), {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    timeout: 15000,
-  });
-
-  outlookTokens.default = {
-    ...tokens,
-    ...tokenRes.data,
-    obtained_at: Date.now(),
-  };
-
-  return outlookTokens.default;
-}
-
-async function getOutlookAccessToken() {
-  if (!outlookTokens.default) {
-    throw new Error("Outlook not connected.");
-  }
-  if (isTokenExpired(outlookTokens.default)) {
-    await refreshOutlookToken();
-  }
-  return outlookTokens.default.access_token;
-}
-
-async function graphRequest(path, options = {}) {
-  const accessToken = await getOutlookAccessToken();
-  const url = `${GRAPH_BASE}${path}`;
-  const method = options.method || "GET";
-
-  const res = await axios({
-    url,
-    method,
-    data: options.data,
-    params: options.params,
-    timeout: 15000,
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-  });
-
-  return res.data;
-}
-
-/* ============================================================
-   7.1) OUTLOOK AUTH URL
+   7) OUTLOOK AUTH URL + CALLBACK + STATUS
 ============================================================ */
 app.post("/api/outlook-auth", (req, res) => {
   try {
     console.log("[Outlook] 🔐 Generating OAuth URL...");
 
-    if (!outlookConfigured()) {
+    if (!isOutlookConfigured()) {
       return res.status(500).json({
         errorCode: "OUTLOOK_CONFIG_INCOMPLETE",
-        error: "Missing OUTLOOK_CLIENT_ID or OUTLOOK_TENANT_ID",
+        error:
+          "Missing OUTLOOK_CLIENT_ID or OUTLOOK_TENANT_ID or OUTLOOK_CLIENT_SECRET",
       });
     }
 
-    const clientId = OUTLOOK_CLIENT_ID;
-    const tenantId = OUTLOOK_TENANT_ID;
     const redirectUri = outlookRedirectUri();
-    const state = String(Date.now());
 
-    const scopes = [
-      "offline_access",
-      "User.Read",
-      "Mail.ReadWrite",
-      "Mail.Send",
-    ].join(" ");
-
-    const authUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(
+    const scope =
+      "User.Read Mail.Read Mail.Send offline_access";
+    const authUrl = `https://login.microsoftonline.com/${OUTLOOK_TENANT_ID}/oauth2/v2.0/authorize?client_id=${OUTLOOK_CLIENT_ID}&redirect_uri=${encodeURIComponent(
       redirectUri
-    )}&response_type=code&scope=${encodeURIComponent(
-      scopes
-    )}&state=${state}&prompt=consent`;
+    )}&response_type=code&response_mode=query&scope=${encodeURIComponent(
+      scope
+    )}&prompt=select_account`;
 
     res.json({ authUrl });
   } catch (e) {
@@ -754,7 +731,7 @@ app.get("/api/outlook/callback", async (req, res) => {
       return res.status(400).send("<h1>Outlook - Code manquant</h1>");
     }
 
-    if (!OUTLOOK_CLIENT_ID || !OUTLOOK_CLIENT_SECRET || !OUTLOOK_TENANT_ID) {
+    if (!isOutlookConfigured()) {
       return res
         .status(500)
         .send("<h1>Outlook non configuré côté backend.</h1>");
@@ -768,7 +745,7 @@ app.get("/api/outlook/callback", async (req, res) => {
       grant_type: "authorization_code",
       code,
       redirect_uri: outlookRedirectUri(),
-      scope: "offline_access User.Read Mail.ReadWrite Mail.Send",
+      scope: "User.Read Mail.Read Mail.Send offline_access",
     });
 
     const tokenRes = await axios.post(tokenUrl, params.toString(), {
@@ -795,7 +772,7 @@ app.get("/api/outlook/callback", async (req, res) => {
       </html>
     `);
   } catch (e) {
-    console.error("[Outlook] callback error:", e?.response?.data || e.message);
+    console.error("[Outlook] Callback error:", e.message);
     res
       .status(500)
       .send("<h1>Erreur lors de la récupération du token Outlook.</h1>");
@@ -819,173 +796,196 @@ app.get("/api/outlook-status", (req, res) => {
 });
 
 /* ============================================================
-   7.2) OUTLOOK FOLDERS
+   7.1) OUTLOOK FOLDERS
    GET /api/outlook/folders
 ============================================================ */
 app.get("/api/outlook/folders", async (req, res) => {
   try {
-    console.log("[Outlook] 📁 Fetching folders...");
-    const data = await graphRequest("/me/mailFolders?$top=200");
+    if (!outlookTokens.default) {
+      return res.status(401).json({
+        ok: false,
+        errorCode: "OUTLOOK_NOT_CONNECTED",
+        message: "Outlook not connected yet.",
+      });
+    }
+
+    const data = await graphGet("/me/mailFolders", {
+      $top: "50",
+    });
+
     const folders = (data.value || []).map((f) => ({
       id: f.id,
       displayName: f.displayName,
       totalItemCount: f.totalItemCount,
       unreadItemCount: f.unreadItemCount,
     }));
-    res.json({ folders });
+
+    res.json({ ok: true, folders });
   } catch (e) {
-    console.error("[Outlook] folders error:", e?.response?.data || e.message);
+    console.error("[Outlook] folders error:", e.message);
     res.status(500).json({
       ok: false,
       errorCode: "OUTLOOK_FOLDERS_ERROR",
-      error: e.message,
-      details: e?.response?.data,
+      message: e.message,
     });
   }
 });
 
 /* ============================================================
-   7.3) OUTLOOK MESSAGES
-   GET /api/outlook/messages?folderId=inbox&top=20&skip=0&search=foo
+   7.2) OUTLOOK MESSAGES
+   GET /api/outlook/messages?folderId=...&top=5
 ============================================================ */
 app.get("/api/outlook/messages", async (req, res) => {
   try {
-    console.log("[Outlook] ✉️ Fetching messages...");
+    if (!outlookTokens.default) {
+      return res.status(401).json({
+        ok: false,
+        errorCode: "OUTLOOK_NOT_CONNECTED",
+        message: "Outlook not connected yet.",
+      });
+    }
 
     const folderId = String(req.query.folderId || "inbox");
-    const top = Math.min(50, Number(req.query.top || 20));
-    const skip = Math.max(0, Number(req.query.skip || 0));
-    const search = String(req.query.search || "").trim();
+    const top = Number(req.query.top || 10);
 
-    const params = new URLSearchParams();
-    params.set("$top", String(top));
-    if (skip) params.set("$skip", String(skip));
-    params.set(
-      "$select",
-      [
-        "id",
-        "subject",
-        "receivedDateTime",
-        "from",
-        "toRecipients",
-        "ccRecipients",
-        "bodyPreview",
-        "hasAttachments",
-        "isRead",
-        "importance",
-        "conversationId",
-      ].join(",")
-    );
-    params.set("$orderby", "receivedDateTime desc");
+    // Special case for inbox alias
+    let path = "/me/mailFolders/inbox/messages";
+    if (folderId !== "inbox") path = `/me/mailFolders/${folderId}/messages`;
 
-    // Search Graph nécessite header ConsistencyLevel + $search
-    const path =
-      search.length > 0
-        ? `/me/mailFolders/${folderId}/messages?$search="${encodeURIComponent(
-            search
-          )}"&${params.toString()}`
-        : `/me/mailFolders/${folderId}/messages?${params.toString()}`;
-
-    const accessToken = await getOutlookAccessToken();
-    const url = `${GRAPH_BASE}${path}`;
-
-    const r = await axios.get(url, {
-      timeout: 15000,
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-        ...(search
-          ? { ConsistencyLevel: "eventual" }
-          : {}),
-      },
+    const data = await graphGet(path, {
+      $top: String(Math.min(Math.max(top, 1), 50)),
+      $orderby: "receivedDateTime desc",
+      $select:
+        "id,subject,from,receivedDateTime,bodyPreview,hasAttachments,isRead",
     });
 
-    const messages = (r.data.value || []).map((m) => ({
+    const messages = (data.value || []).map((m) => ({
       id: m.id,
       subject: m.subject || "(Sans sujet)",
+      from: m.from?.emailAddress
+        ? {
+            name: m.from.emailAddress.name,
+            address: m.from.emailAddress.address,
+          }
+        : null,
       receivedDateTime: m.receivedDateTime,
-      from: m.from?.emailAddress || null,
-      to: (m.toRecipients || []).map((x) => x.emailAddress),
-      cc: (m.ccRecipients || []).map((x) => x.emailAddress),
       bodyPreview: m.bodyPreview || "",
       hasAttachments: !!m.hasAttachments,
       isRead: !!m.isRead,
-      importance: m.importance || "normal",
-      conversationId: m.conversationId || null,
     }));
 
-    res.json({ messages });
+    res.json({ ok: true, folderId, messages });
   } catch (e) {
-    console.error("[Outlook] messages error:", e?.response?.data || e.message);
+    console.error("[Outlook] messages error:", e.message);
     res.status(500).json({
       ok: false,
       errorCode: "OUTLOOK_MESSAGES_ERROR",
-      error: e.message,
-      details: e?.response?.data,
+      message: e.message,
     });
   }
 });
 
 /* ============================================================
-   7.4) OUTLOOK SEND MAIL
+   7.3) OUTLOOK SEND EMAIL
    POST /api/outlook/send
-   Body: { to, subject, content, cc?, bcc? }
+   body: { to, subject, content, cc?, bcc? }
 ============================================================ */
 app.post("/api/outlook/send", async (req, res) => {
   try {
-    console.log("[Outlook] 📤 Sending mail...");
-
-    const { to, cc, bcc, subject, content } = req.body || {};
-    if (!to || !subject || !content) {
-      return res.status(400).json({
+    if (!outlookTokens.default) {
+      return res.status(401).json({
         ok: false,
-        error: "to, subject, content are required",
+        errorCode: "OUTLOOK_NOT_CONNECTED",
+        message: "Outlook not connected yet.",
       });
     }
 
-    const toArray = Array.isArray(to) ? to : [to];
-    const ccArray = cc ? (Array.isArray(cc) ? cc : [cc]) : [];
-    const bccArray = bcc ? (Array.isArray(bcc) ? bcc : [bcc]) : [];
+    const { to, subject, content, cc, bcc } = req.body || {};
+    if (!to || !subject || !content) {
+      return res.status(400).json({
+        ok: false,
+        errorCode: "MISSING_FIELDS",
+        message: "Required: to, subject, content",
+      });
+    }
+
+    const toList = Array.isArray(to) ? to : [to];
+    const ccList = cc ? (Array.isArray(cc) ? cc : [cc]) : [];
+    const bccList = bcc ? (Array.isArray(bcc) ? bcc : [bcc]) : [];
 
     const payload = {
       message: {
         subject,
-        body: {
-          contentType: "HTML",
-          content,
-        },
-        toRecipients: toArray.map((email) => ({
-          emailAddress: { address: email },
+        body: { contentType: "HTML", content },
+        toRecipients: toList.map((addr) => ({
+          emailAddress: { address: addr },
         })),
-        ccRecipients: ccArray.map((email) => ({
-          emailAddress: { address: email },
+        ccRecipients: ccList.map((addr) => ({
+          emailAddress: { address: addr },
         })),
-        bccRecipients: bccArray.map((email) => ({
-          emailAddress: { address: email },
+        bccRecipients: bccList.map((addr) => ({
+          emailAddress: { address: addr },
         })),
       },
       saveToSentItems: true,
     };
 
-    await graphRequest("/me/sendMail", {
-      method: "POST",
-      data: payload,
-    });
+    await graphPost("/me/sendMail", payload);
 
     res.json({ ok: true });
   } catch (e) {
-    console.error("[Outlook] send error:", e?.response?.data || e.message);
+    console.error("[Outlook] send error:", e.message);
     res.status(500).json({
       ok: false,
       errorCode: "OUTLOOK_SEND_ERROR",
-      error: e.message,
-      details: e?.response?.data,
+      message: e.message,
     });
   }
 });
 
 /* ============================================================
-   8) TIDIO CONFIG
+   8) ZAPIER SMS PROXY (ANTI-CORS)
+   POST /api/zapier/sms
+   body: { to, message, meta? }
+============================================================ */
+app.post("/api/zapier/sms", async (req, res) => {
+  try {
+    if (!ZAPIER_SMS_WEBHOOK_URL) {
+      return res.status(503).json({
+        ok: false,
+        errorCode: "ZAPIER_WEBHOOK_MISSING",
+        message: "Missing ZAPIER_SMS_WEBHOOK_URL in env.",
+      });
+    }
+
+    const { to, message, meta } = req.body || {};
+    if (!to || !message) {
+      return res.status(400).json({
+        ok: false,
+        errorCode: "MISSING_FIELDS",
+        message: "Required: to, message",
+      });
+    }
+
+    await axios.post(
+      ZAPIER_SMS_WEBHOOK_URL,
+      { to, message, meta: meta || null },
+      { timeout: 12000 }
+    );
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[Zapier] sms error:", e.message);
+    res.status(500).json({
+      ok: false,
+      errorCode: "ZAPIER_SMS_ERROR",
+      message: e.message,
+    });
+  }
+});
+
+/* ============================================================
+   9) TIDIO CONFIG
 ============================================================ */
 app.get("/api/tidio-config", (req, res) => {
   try {
@@ -1002,7 +1002,7 @@ app.get("/api/tidio-config", (req, res) => {
 });
 
 /* ============================================================
-   9) YOUTUBE SEARCH (widget)
+   10) YOUTUBE SEARCH (widget)
    ✅ Routes:
    - GET /api/youtube/search?q=...
    - GET /api/youtube-search?q=... (alias compat front)
@@ -1071,44 +1071,11 @@ async function handleYoutubeSearch(req, res) {
   }
 }
 
-// Primary + alias legacy
 app.get("/api/youtube/search", handleYoutubeSearch);
 app.get("/api/youtube-search", handleYoutubeSearch);
 
 /* ============================================================
-   9.1) ZAPIER SMS PROXY (ANTI-CORS)
-   POST /api/zapier/sms
-============================================================ */
-app.post("/api/zapier/sms", async (req, res) => {
-  try {
-    if (!ZAPIER_SMS_WEBHOOK_URL) {
-      return res.status(503).json({
-        ok: false,
-        errorCode: "ZAPIER_WEBHOOK_MISSING",
-        error: "ZAPIER_SMS_WEBHOOK_URL not configured",
-      });
-    }
-
-    const payload = req.body || {};
-    const r = await axios.post(ZAPIER_SMS_WEBHOOK_URL, payload, {
-      timeout: 15000,
-      headers: { "Content-Type": "application/json" },
-    });
-
-    res.json({ ok: true, status: r.status });
-  } catch (e) {
-    console.error("[Zapier] sms proxy error:", e?.response?.data || e.message);
-    res.status(500).json({
-      ok: false,
-      errorCode: "ZAPIER_PROXY_ERROR",
-      error: e.message,
-      details: e?.response?.data,
-    });
-  }
-});
-
-/* ============================================================
-   10) ERROR HANDLING
+   11) ERROR HANDLING
 ============================================================ */
 app.use((err, req, res, next) => {
   console.error("[Error]", err);
@@ -1119,11 +1086,11 @@ app.use((err, req, res, next) => {
 });
 
 /* ============================================================
-   11) START SERVER
+   12) START SERVER
 ============================================================ */
 app.listen(PORT, () => {
   console.log(`✅ Backend running on port ${PORT}`);
   console.log(`📍 URL: ${baseUrl}`);
   console.log(`📞 TwiML Voice URL: ${baseUrl}/api/voice`);
-  console.log(`📧 Outlook callback URL: ${baseUrl}/api/outlook/callback`);
+  console.log(`📧 Outlook callback URL: ${outlookRedirectUri()}`);
 });
