@@ -40,6 +40,7 @@ const allowedOrigins = [
   "https://cdpn.io",
   "https://codepen.io",
   "https://afi-ops.ca", // prod
+  "http://localhost:3000" // dev local
 ];
 
 const corsOptions = {
@@ -64,11 +65,10 @@ app.use(cors(corsOptions));
 // Ensure preflight works everywhere
 app.options("*", cors(corsOptions));
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "5mb" }));
 
 const PORT = process.env.PORT || 10000;
-const baseUrl =
-  process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+const baseUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 
 /* ============================================================
    ENV / CONFIG SNAPSHOT
@@ -96,7 +96,7 @@ const {
   TWILIO_TOKEN_TTL,
   YOUTUBE_API_KEY,
 
-  ZAPIER_SMS_WEBHOOK_URL, // optional but useful (anti-CORS)
+  ZAPIER_SMS_WEBHOOK_URL,
 } = process.env;
 
 const MONDAY_TTL_MS = Number(MONDAY_TTL_MS_ENV || 25000);
@@ -114,6 +114,7 @@ const TWILIO_ENABLED =
 
 /* ============================================================
    OUTLOOK TOKEN STORE (in-memory)
+   Note: Redémarre le serveur = Déconnecte Outlook
 ============================================================ */
 const outlookTokens = { default: null };
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
@@ -124,38 +125,14 @@ const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 console.log("🚀 AFI OPS Backend starting...");
 console.log("ENV vars loaded:", {
   TWILIO_ACCOUNT_SID: TWILIO_ACCOUNT_SID ? "✓" : "✗",
-  TWILIO_API_KEY: TWILIO_API_KEY ? "✓(SK...)" : "✗",
-  TWILIO_API_SECRET: TWILIO_API_SECRET ? "✓" : "✗",
-  TWILIO_TWIML_APP_SID: TWILIO_TWIML_APP_SID ? "✓(AP...)" : "✗",
-  TWILIO_PHONE_NUMBER: TWILIO_PHONE_NUMBER ? "✓" : "✗",
-
   MONDAY_TOKEN: MONDAY_TOKEN ? "✓" : "✗",
-  MONDAY_BOARD_ID: MONDAY_BOARD_ID ? "✓" : "⚠️ fallback",
-  MONDAY_GROUP_ID: MONDAY_GROUP_ID ? `✓ (${MONDAY_GROUP_ID})` : "default topics",
-  MONDAY_TTL_MS: MONDAY_TTL_MS_ENV ? `✓ (${MONDAY_TTL_MS_ENV})` : "default 25s",
-  MONDAY_ITEMS_LIMIT: MONDAY_ITEMS_LIMIT_ENV
-    ? `✓ (${MONDAY_ITEMS_LIMIT_ENV})`
-    : "default 50",
-  MONDAY_API_VERSION: MONDAY_API_VERSION,
-
   OUTLOOK_CLIENT_ID: OUTLOOK_CLIENT_ID ? "✓" : "✗",
-  OUTLOOK_TENANT_ID: OUTLOOK_TENANT_ID ? "✓" : "✗",
-  OUTLOOK_CLIENT_SECRET: OUTLOOK_CLIENT_SECRET ? "✓" : "✗",
-  OUTLOOK_REDIRECT_URI:
-    OUTLOOK_REDIRECT_URI || "⚠️ default /api/outlook/callback",
-
-  TIDIO_PROJECT_ID: TIDIO_PROJECT_ID ? "✓" : "✗",
   YOUTUBE_API_KEY: YOUTUBE_API_KEY ? "✓" : "✗",
-  ZAPIER_SMS_WEBHOOK_URL: ZAPIER_SMS_WEBHOOK_URL ? "✓" : "optional empty",
-
-  TWILIO_TOKEN_TTL: TWILIO_TOKEN_TTL
-    ? `✓ (${TWILIO_TOKEN_TTL}s)`
-    : "default 3600s",
 });
 
 if (!TWILIO_ENABLED) {
   console.warn(
-    "⚠️ Twilio not fully configured. Softphone endpoints will return 503 until env vars are fixed."
+    "⚠️ Twilio not fully configured. Softphone endpoints will return 503."
   );
 }
 
@@ -254,32 +231,7 @@ app.get("/", (req, res) => {
           ? "connected"
           : "configured_not_connected"
         : "not_configured",
-      tidio: !!TIDIO_PROJECT_ID ? "ready" : "not_configured",
       youtube: !!YOUTUBE_API_KEY ? "ready" : "missing_key",
-      transcript: "poc_safe",
-    },
-  });
-});
-
-/* ============================================================
-   0.1) TWILIO HEALTH (debug)
-============================================================ */
-app.get("/api/twilio/health", (req, res) => {
-  if (!TWILIO_ENABLED) {
-    return res.status(503).json({
-      ok: false,
-      errorCode: "TWILIO_CONFIG_INCOMPLETE",
-      message:
-        "Twilio env vars are incomplete. Check TWILIO_ACCOUNT_SID, TWILIO_API_KEY, TWILIO_API_SECRET, TWILIO_TWIML_APP_SID.",
-    });
-  }
-
-  res.json({
-    ok: true,
-    twilio: {
-      accountSid: TWILIO_ACCOUNT_SID.replace(/^(.{6}).+$/, "$1…"),
-      twimlAppSid: TWILIO_TWIML_APP_SID.replace(/^(.{4}).+$/, "$1…"),
-      tokenTtlSeconds: Number(TWILIO_TOKEN_TTL || 3600),
     },
   });
 });
@@ -289,22 +241,18 @@ app.get("/api/twilio/health", (req, res) => {
 ============================================================ */
 app.post("/api/twilio-token", (req, res) => {
   try {
-    console.log("[Twilio] 🔐 Token request received...");
-
     if (!TWILIO_ENABLED) {
-      console.warn("[Twilio] ❌ Not configured, rejecting.");
       return res.status(503).json({
         errorCode: "TWILIO_CONFIG_INCOMPLETE",
-        error:
-          "Twilio is not fully configured on the backend. Check TWILIO_* env vars.",
+        error: "Twilio backend config missing.",
       });
     }
 
     const AccessToken = twilio.jwt.AccessToken;
     const VoiceGrant = AccessToken.VoiceGrant;
     const identity = req.body?.identity || "afi-agent";
-
     const ttl = Number(TWILIO_TOKEN_TTL || 3600);
+
     const token = new AccessToken(
       TWILIO_ACCOUNT_SID,
       TWILIO_API_KEY,
@@ -322,17 +270,11 @@ app.post("/api/twilio-token", (req, res) => {
     res.json({
       token: token.toJwt(),
       identity,
-      accountSid: TWILIO_ACCOUNT_SID,
-      phoneNumber: TWILIO_PHONE_NUMBER || null,
       voiceUrl: `${baseUrl}/api/voice`,
-      ttlSeconds: ttl,
     });
   } catch (e) {
-    console.error("[Twilio] ❌ Token Error:", e);
-    res.status(500).json({
-      errorCode: "TWILIO_TOKEN_ERROR",
-      error: e.message || "Failed to generate Twilio token",
-    });
+    console.error("[Twilio] Token Error:", e);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -341,16 +283,12 @@ app.post("/api/twilio-token", (req, res) => {
 ============================================================ */
 app.post("/api/voice", (req, res) => {
   try {
-    console.log("[Voice] 📞 Incoming TwiML request...");
-
     const VoiceResponse = twilio.twiml.VoiceResponse;
     const response = new VoiceResponse();
     const { To } = req.body || {};
 
     if (!TWILIO_ENABLED) {
-      response.say(
-        "Le service d'appel AFI OPS n'est pas disponible pour le moment."
-      );
+      response.say("Service non disponible.");
       res.type("text/xml");
       return res.send(response.toString());
     }
@@ -360,49 +298,22 @@ app.post("/api/voice", (req, res) => {
         callerId: TWILIO_PHONE_NUMBER,
         timeout: 30,
       });
-
+      // Detect if number or client
       if (/^[\d\+\-\(\) ]+$/.test(To)) dial.number(To);
       else dial.client(To);
     } else {
-      response.say("Merci d'appeler AFI OPS. Aucun destinataire spécifié.");
+      response.say("AFI OPS Console. Aucun destinataire.");
     }
 
     res.type("text/xml");
     res.send(response.toString());
   } catch (e) {
-    console.error("[Voice] ❌ TwiML Error:", e);
-    res.status(500).json({
-      errorCode: "TWILIO_TWIML_ERROR",
-      error: e.message || "Failed to generate TwiML",
-    });
+    res.status(500).send(e.message);
   }
 });
 
 /* ============================================================
-   3) MONDAY HELPERS
-============================================================ */
-const MONDAY_URL = "https://api.monday.com/v2";
-
-function mondayHeaders() {
-  if (!MONDAY_TOKEN) throw new Error("Missing MONDAY_TOKEN");
-  return {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${MONDAY_TOKEN}`,
-    "API-Version": MONDAY_API_VERSION,
-  };
-}
-
-async function mondayRequest(query, variables) {
-  const res = await axios.post(
-    MONDAY_URL,
-    { query, variables },
-    { headers: mondayHeaders(), timeout: 15000 }
-  );
-  return res.data;
-}
-
-/* ============================================================
-   4) MONDAY TICKETS PROXY + CACHE TTL
+   3) MONDAY API
 ============================================================ */
 const mondayCache = {
   data: null,
@@ -411,13 +322,28 @@ const mondayCache = {
   lastGroupId: null,
 };
 
-app.get("/api/monday/tickets", async (req, res) => {
-  console.log("[API] 📅 Fetching tickets from Monday...");
+async function mondayRequest(query, variables) {
+  const res = await axios.post(
+    "https://api.monday.com/v2",
+    { query, variables },
+    {
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${MONDAY_TOKEN}`,
+        "API-Version": MONDAY_API_VERSION,
+      },
+      timeout: 15000,
+    }
+  );
+  return res.data;
+}
 
+app.get("/api/monday/tickets", async (req, res) => {
   const now = Date.now();
   const boardId = Number(req.query.boardId || DEFAULT_BOARD_ID);
   const groupId = String(req.query.groupId || DEFAULT_GROUP_ID);
 
+  // Cache strategy
   if (
     mondayCache.data &&
     mondayCache.expiresAt > now &&
@@ -430,8 +356,6 @@ app.get("/api/monday/tickets", async (req, res) => {
   const query = `
     query ($boardId: ID!, $limit: Int!) {
       boards(ids: [$boardId]) {
-        id
-        name
         items_page(limit: $limit) {
           items {
             id
@@ -453,36 +377,30 @@ app.get("/api/monday/tickets", async (req, res) => {
 
     if (data.errors) return res.status(400).json({ errors: data.errors });
 
-    const board = data?.data?.boards?.[0];
-    const rawItems = board?.items_page?.items || [];
-
+    const rawItems = data?.data?.boards?.[0]?.items_page?.items || [];
+    
+    // Normalize data
     const normalized = rawItems.map((item) => {
-      const cols = item.column_values || [];
       const colMap = {};
-      cols.forEach((col) => {
-        colMap[col.id] = {
-          id: col.id,
-          text: col.text,
-          type: col.type,
-          value: col.value,
-        };
+      (item.column_values || []).forEach((col) => {
+        colMap[col.id] = { id: col.id, text: col.text, value: col.value, type: col.type };
       });
       return {
         id: item.id,
         name: item.name,
         updated_at: item.updated_at,
-        group: item.group || null,
+        group: item.group,
         column_values: colMap,
       };
     });
 
+    // Client-side filtering because API v2023-10+ items_page doesn't support group_ids easily
     const items =
       groupId === "all"
         ? normalized
         : normalized.filter((it) => it.group?.id === groupId);
 
     const payload = { items };
-
     mondayCache.data = payload;
     mondayCache.expiresAt = now + MONDAY_TTL_MS;
     mondayCache.lastBoardId = boardId;
@@ -490,126 +408,20 @@ app.get("/api/monday/tickets", async (req, res) => {
 
     res.json(payload);
   } catch (error) {
-    console.error("[API] ❌ Monday fetch error:", error.message);
-    res.status(500).json({
-      error: "Failed to fetch Monday tickets",
-      details: error.message,
-    });
+    console.error("[Monday] Error:", error.message);
+    res.status(500).json({ error: "Failed to fetch Monday tickets" });
   }
 });
 
-/* ============================================================
-   5) MONDAY CREATE / UPSERT / RESOLVE
-============================================================ */
-const INTENT_MAP = {
-  service: "🔧 Service",
-  warranty: "🛡️ Garantie",
-  parts: "🔩 Pièce",
-  quote: "💰 Soumission",
-};
-
-const LANGUAGE_MAP = {
-  fr: "🃏 Français",
-  en: "🇬🇧 English",
-};
-
-app.post("/api/monday/create-ticket", async (req, res) => {
-  console.log("[API] 🧾 Creating Monday ticket...");
-
-  const boardId = Number(req.body.boardId || DEFAULT_BOARD_ID);
-  const groupId = String(req.body.groupId || DEFAULT_GROUP_ID);
-
-  const {
-    full_name,
-    phone,
-    email,
-    address,
-    issue_description,
-    intent,
-    language,
-    zap_meta_timestamp,
-  } = req.body || {};
-
-  if (!full_name || !intent) {
-    return res.status(400).json({
-      error: "Missing required fields: full_name, intent",
-    });
-  }
-
-  const mapped_intent = INTENT_MAP[intent] || intent;
-  const mapped_language = LANGUAGE_MAP[language] || language;
-  const item_name = `Ticket AFI – ${full_name} – ${intent}`;
-
-  const column_values = {
-    text_mkx51q5v: full_name || "",
-    phone_mkx5xy3x: phone || "",
-    email_mkx53410: email || "",
-    text_mkx528gx: address || "",
-    long_text_mkx59qsr: issue_description || "",
-    status: mapped_intent,
-    color_mkx5e9jt: mapped_language,
-    date_mkx5asat:
-      zap_meta_timestamp || new Date().toISOString().split("T")[0],
-  };
-
-  const mutation = `
-    mutation ($boardId: ID!, $groupId: String!, $itemName: String!, $cols: JSON!) {
-      create_item(
-        board_id: $boardId,
-        group_id: $groupId,
-        item_name: $itemName,
-        column_values: $cols
-      ) { id name }
-    }
-  `;
-
-  try {
-    const data = await mondayRequest(mutation, {
-      boardId,
-      groupId,
-      itemName: item_name,
-      cols: JSON.stringify(column_values),
-    });
-
-    if (data.errors) return res.status(400).json({ errors: data.errors });
-
-    mondayCache.data = null;
-
-    res.json({
-      ok: true,
-      item: data?.data?.create_item,
-      item_name,
-      column_values,
-      boardId,
-      groupId,
-    });
-  } catch (e) {
-    console.error("[API] ❌ Create ticket failed:", e.message);
-    res.status(500).json({
-      ok: false,
-      error: "Failed to create Monday ticket",
-      details: e.message,
-    });
-  }
-});
-
+// UPSERT (UPDATE) Ticket
 app.post("/api/monday/upsert-ticket", async (req, res) => {
-  console.log("[API] ♻️ Upserting Monday ticket...");
-
   try {
-    const { ticket, ticketId } = req.body || {};
-    if (!ticketId && !ticket?.id) {
-      return res.status(400).json({ error: "ticketId missing" });
-    }
-
-    const itemId = String(ticket?.mondayItemId || ticketId || ticket?.id);
-
+    const { ticketId, ticket } = req.body || {};
+    const itemId = String(ticketId || ticket?.id);
+    
+    // Example: Update the 'long_text' or description
     const colVals = {
-      long_text_mkx59qsr:
-        ticket?.issue_description ||
-        ticket?.problem ||
-        ticket?.raw?.long_text_mkx59qsr ||
-        "",
+      long_text_mkx59qsr: ticket?.issue_description || ticket?.problem || ""
     };
 
     const mutation = `
@@ -622,152 +434,42 @@ app.post("/api/monday/upsert-ticket", async (req, res) => {
       }
     `;
 
-    const data = await mondayRequest(mutation, {
-      itemId,
-      cols: JSON.stringify(colVals),
-    });
-
-    if (data.errors) return res.status(400).json({ errors: data.errors });
-
-    mondayCache.data = null;
-
-    res.json({
-      ok: true,
-      itemId,
-      status: "updated",
-    });
-  } catch (e) {
-    console.error("[API] ❌ Upsert failed:", e.message);
-    res.status(500).json({
-      ok: false,
-      error: "Failed to upsert Monday ticket",
-      details: e.message,
-    });
-  }
-});
-
-app.post("/api/monday/resolve-ticket", async (req, res) => {
-  console.log("[API] ✅ Resolving Monday ticket...");
-
-  try {
-    const { ticketId, mondayItemId } = req.body || {};
-    const itemId = String(mondayItemId || ticketId);
-    if (!itemId) {
-      return res.status(400).json({ error: "ticketId missing" });
-    }
-
-    const colVals = { status: "✅ Résolu" };
-
-    const mutation = `
-      mutation ($itemId: ID!, $cols: JSON!) {
-        change_multiple_column_values(
-          item_id: $itemId,
-          board_id: ${DEFAULT_BOARD_ID},
-          column_values: $cols
-        ) { id }
-      }
-    `;
-
-    const data = await mondayRequest(mutation, {
-      itemId,
-      cols: JSON.stringify(colVals),
-    });
-
-    if (data.errors) return res.status(400).json({ errors: data.errors });
-
-    mondayCache.data = null;
-
-    res.json({
-      ok: true,
-      itemId,
-      status: "resolved",
-    });
-  } catch (e) {
-    console.error("[API] ❌ Resolve failed:", e.message);
-    res.status(500).json({
-      ok: false,
-      error: "Failed to resolve Monday ticket",
-      details: e.message,
-    });
-  }
-});
-
-/* ============================================================
-   6) TRANSCRIPT ENDPOINTS (POC SAFE)
-============================================================ */
-app.get("/api/transcript/active", (req, res) => {
-  return res.status(501).json({
-    ok: false,
-    errorCode: "TRANSCRIPT_NOT_IMPLEMENTED",
-    message: "Transcript backend not wired yet.",
-    text: "",
-  });
-});
-
-app.get("/api/transcript/by-sid", (req, res) => {
-  return res.status(501).json({
-    ok: false,
-    errorCode: "TRANSCRIPT_NOT_IMPLEMENTED",
-    message: "Transcript backend not wired yet.",
-    text: "",
-  });
-});
-
-/* ============================================================
-   7) OUTLOOK AUTH URL + CALLBACK + STATUS
-============================================================ */
-app.post("/api/outlook-auth", (req, res) => {
-  try {
-    console.log("[Outlook] 🔐 Generating OAuth URL...");
-
-    if (!isOutlookConfigured()) {
-      return res.status(500).json({
-        errorCode: "OUTLOOK_CONFIG_INCOMPLETE",
-        error:
-          "Missing OUTLOOK_CLIENT_ID or OUTLOOK_TENANT_ID or OUTLOOK_CLIENT_SECRET",
-      });
-    }
-
-    const redirectUri = outlookRedirectUri();
-
-    const scope =
-      "User.Read Mail.Read Mail.Send offline_access";
-    const authUrl = `https://login.microsoftonline.com/${OUTLOOK_TENANT_ID}/oauth2/v2.0/authorize?client_id=${OUTLOOK_CLIENT_ID}&redirect_uri=${encodeURIComponent(
-      redirectUri
-    )}&response_type=code&response_mode=query&scope=${encodeURIComponent(
-      scope
-    )}&prompt=select_account`;
-
-    res.json({ authUrl });
+    await mondayRequest(mutation, { itemId, cols: JSON.stringify(colVals) });
+    mondayCache.data = null; // Invalidate cache
+    res.json({ ok: true, status: "updated" });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
+/* ============================================================
+   6) TRANSCRIPT (POC)
+============================================================ */
+app.get("/api/transcript/active", (req, res) => {
+  // Not wired to live stt yet
+  res.status(501).json({ ok: false, message: "Transcript backend not wired yet" });
+});
+
+/* ============================================================
+   7) OUTLOOK AUTH & API
+============================================================ */
+app.post("/api/outlook-auth", (req, res) => {
+  if (!isOutlookConfigured()) return res.status(500).json({ error: "Outlook config missing" });
+
+  const scope = "User.Read Mail.Read Mail.Send offline_access";
+  const authUrl = `https://login.microsoftonline.com/${OUTLOOK_TENANT_ID}/oauth2/v2.0/authorize?client_id=${OUTLOOK_CLIENT_ID}&redirect_uri=${encodeURIComponent(
+    outlookRedirectUri()
+  )}&response_type=code&response_mode=query&scope=${encodeURIComponent(scope)}&prompt=select_account`;
+
+  res.json({ authUrl });
+});
+
 app.get("/api/outlook/callback", async (req, res) => {
   try {
-    const { code, error, error_description } = req.query;
-
-    if (error) {
-      return res
-        .status(400)
-        .send(
-          `<h1>Outlook - Erreur</h1><p>${error_description || error}</p>`
-        );
-    }
-
-    if (!code) {
-      return res.status(400).send("<h1>Outlook - Code manquant</h1>");
-    }
-
-    if (!isOutlookConfigured()) {
-      return res
-        .status(500)
-        .send("<h1>Outlook non configuré côté backend.</h1>");
-    }
+    const { code } = req.query;
+    if (!code) return res.status(400).send("Code manquant");
 
     const tokenUrl = `https://login.microsoftonline.com/${OUTLOOK_TENANT_ID}/oauth2/v2.0/token`;
-
     const params = new URLSearchParams({
       client_id: OUTLOOK_CLIENT_ID,
       client_secret: OUTLOOK_CLIENT_SECRET,
@@ -779,335 +481,124 @@ app.get("/api/outlook/callback", async (req, res) => {
 
     const tokenRes = await axios.post(tokenUrl, params.toString(), {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      timeout: 15000,
     });
 
-    outlookTokens.default = {
-      ...tokenRes.data,
-      obtained_at: Date.now(),
-    };
+    outlookTokens.default = { ...tokenRes.data, obtained_at: Date.now() };
 
     res.send(`
-      <html>
-        <body style="background:#020617;color:#e5e7eb;font-family:-apple-system,system-ui;padding:32px">
-          <h1>Outlook connecté ✅</h1>
-          <p>Tu peux fermer cette fenêtre et revenir à AFI OPS Cockpit.</p>
-          <script>
-            if (window.opener) {
-              window.opener.postMessage({ type: "OUTLOOK_CONNECTED" }, "*");
-            }
-          </script>
-        </body>
-      </html>
+      <html><body style="background:#111;color:#eee;font-family:sans-serif;padding:40px;">
+        <h1>Outlook Connecté ✅</h1>
+        <p>Vous pouvez fermer cette fenêtre.</p>
+        <script>if(window.opener){window.opener.postMessage({type:"OUTLOOK_CONNECTED"},"*");}</script>
+      </body></html>
     `);
   } catch (e) {
-    console.error("[Outlook] Callback error:", e.message);
-    res
-      .status(500)
-      .send("<h1>Erreur lors de la récupération du token Outlook.</h1>");
+    res.status(500).send("Erreur Auth Outlook: " + e.message);
   }
 });
 
 app.get("/api/outlook-status", (req, res) => {
-  const tokens = outlookTokens.default;
-  if (!tokens) return res.json({ connected: false });
-
-  const expiresIn = tokens.expires_in
-    ? Math.max(
-        0,
-        Math.floor(
-          (tokens.obtained_at + tokens.expires_in * 1000 - Date.now()) / 1000
-        )
-      )
-    : null;
-
-  res.json({ connected: true, expiresInSeconds: expiresIn });
+  const t = outlookTokens.default;
+  if (!t) return res.json({ connected: false });
+  res.json({ connected: true });
 });
 
-/* ============================================================
-   7.1) OUTLOOK FOLDERS
-============================================================ */
-app.get("/api/outlook/folders", async (req, res) => {
-  try {
-    if (!outlookTokens.default) {
-      return res.status(401).json({
-        ok: false,
-        errorCode: "OUTLOOK_NOT_CONNECTED",
-        message: "Outlook not connected yet.",
-      });
-    }
-
-    const data = await graphGet("/me/mailFolders", { $top: "50" });
-
-    const folders = (data.value || []).map((f) => ({
-      id: f.id,
-      displayName: f.displayName,
-      totalItemCount: f.totalItemCount,
-      unreadItemCount: f.unreadItemCount,
-    }));
-
-    res.json({ ok: true, folders });
-  } catch (e) {
-    console.error("[Outlook] folders error:", e.message);
-    res.status(500).json({
-      ok: false,
-      errorCode: "OUTLOOK_FOLDERS_ERROR",
-      message: e.message,
-    });
-  }
-});
-
-/* ============================================================
-   7.2) OUTLOOK MESSAGES
-============================================================ */
 app.get("/api/outlook/messages", async (req, res) => {
   try {
-    if (!outlookTokens.default) {
-      return res.status(401).json({
-        ok: false,
-        errorCode: "OUTLOOK_NOT_CONNECTED",
-        message: "Outlook not connected yet.",
-      });
-    }
-
-    const folderId = String(req.query.folderId || "inbox");
-    const top = Number(req.query.top || 10);
-
-    let path = "/me/mailFolders/inbox/messages";
-    if (folderId !== "inbox") path = `/me/mailFolders/${folderId}/messages`;
-
-    const data = await graphGet(path, {
-      $top: String(Math.min(Math.max(top, 1), 50)),
+    if (!outlookTokens.default) return res.status(401).json({ error: "Not connected" });
+    
+    // Fetch top 15 messages from Inbox
+    const data = await graphGet("/me/mailFolders/inbox/messages", {
+      $top: "15",
       $orderby: "receivedDateTime desc",
-      $select:
-        "id,subject,from,receivedDateTime,bodyPreview,hasAttachments,isRead",
+      $select: "id,subject,from,receivedDateTime,bodyPreview,isRead"
     });
-
-    const messages = (data.value || []).map((m) => ({
+    
+    // Simplify for frontend
+    const messages = (data.value || []).map(m => ({
       id: m.id,
-      subject: m.subject || "(Sans sujet)",
-      from: m.from?.emailAddress
-        ? {
-            name: m.from.emailAddress.name,
-            address: m.from.emailAddress.address,
-          }
-        : null,
+      subject: m.subject,
+      from: m.from?.emailAddress ? { name: m.from.emailAddress.name, address: m.from.emailAddress.address } : null,
       receivedDateTime: m.receivedDateTime,
-      bodyPreview: m.bodyPreview || "",
-      hasAttachments: !!m.hasAttachments,
-      isRead: !!m.isRead,
+      bodyPreview: m.bodyPreview,
+      isRead: m.isRead
     }));
 
-    res.json({ ok: true, folderId, messages });
+    res.json({ messages });
   } catch (e) {
-    console.error("[Outlook] messages error:", e.message);
-    res.status(500).json({
-      ok: false,
-      errorCode: "OUTLOOK_MESSAGES_ERROR",
-      message: e.message,
-    });
+    res.status(500).json({ error: e.message });
   }
 });
 
-/* ============================================================
-   7.3) OUTLOOK SEND EMAIL
-============================================================ */
 app.post("/api/outlook/send", async (req, res) => {
   try {
-    if (!outlookTokens.default) {
-      return res.status(401).json({
-        ok: false,
-        errorCode: "OUTLOOK_NOT_CONNECTED",
-        message: "Outlook not connected yet.",
-      });
-    }
-
-    const { to, subject, content, cc, bcc } = req.body || {};
-    if (!to || !subject || !content) {
-      return res.status(400).json({
-        ok: false,
-        errorCode: "MISSING_FIELDS",
-        message: "Required: to, subject, content",
-      });
-    }
-
-    const toList = Array.isArray(to) ? to : [to];
-    const ccList = cc ? (Array.isArray(cc) ? cc : [cc]) : [];
-    const bccList = bcc ? (Array.isArray(bcc) ? bcc : [bcc]) : [];
-
+    if (!outlookTokens.default) return res.status(401).json({ error: "Not connected" });
+    const { to, subject, htmlBody } = req.body;
+    
     const payload = {
       message: {
         subject,
-        body: { contentType: "HTML", content },
-        toRecipients: toList.map((addr) => ({
-          emailAddress: { address: addr },
-        })),
-        ccRecipients: ccList.map((addr) => ({
-          emailAddress: { address: addr },
-        })),
-        bccRecipients: bccList.map((addr) => ({
-          emailAddress: { address: addr },
-        })),
+        body: { contentType: "HTML", content: htmlBody },
+        toRecipients: to.map(addr => ({ emailAddress: { address: addr } }))
       },
-      saveToSentItems: true,
+      saveToSentItems: true
     };
 
     await graphPost("/me/sendMail", payload);
-
     res.json({ ok: true });
-  } catch (e) {
-    console.error("[Outlook] send error:", e.message);
-    res.status(500).json({
-      ok: false,
-      errorCode: "OUTLOOK_SEND_ERROR",
-      message: e.message,
-    });
-  }
-});
-
-/* ============================================================
-   8) ZAPIER SMS PROXY (ANTI-CORS)
-============================================================ */
-app.post("/api/zapier/sms", async (req, res) => {
-  try {
-    if (!ZAPIER_SMS_WEBHOOK_URL) {
-      return res.status(503).json({
-        ok: false,
-        errorCode: "ZAPIER_WEBHOOK_MISSING",
-        message: "Missing ZAPIER_SMS_WEBHOOK_URL in env.",
-      });
-    }
-
-    const { to, message, meta } = req.body || {};
-    if (!to || !message) {
-      return res.status(400).json({
-        ok: false,
-        errorCode: "MISSING_FIELDS",
-        message: "Required: to, message",
-      });
-    }
-
-    await axios.post(
-      ZAPIER_SMS_WEBHOOK_URL,
-      { to, message, meta: meta || null },
-      { timeout: 12000 }
-    );
-
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("[Zapier] sms error:", e.message);
-    res.status(500).json({
-      ok: false,
-      errorCode: "ZAPIER_SMS_ERROR",
-      message: e.message,
-    });
-  }
-});
-
-/* ============================================================
-   9) TIDIO CONFIG
-============================================================ */
-app.get("/api/tidio-config", (req, res) => {
-  try {
-    if (!TIDIO_PROJECT_ID) {
-      return res.status(500).json({
-        errorCode: "TIDIO_CONFIG_INCOMPLETE",
-        error: "Missing TIDIO_PROJECT_ID",
-      });
-    }
-    res.json({ projectId: TIDIO_PROJECT_ID });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
 /* ============================================================
-   10) YOUTUBE SEARCH (widget)
+   8) ZAPIER PROXY (SMS)
 ============================================================ */
-const YT_CACHE_TTL_MS = 60_000;
-const ytCache = new Map();
-
-async function handleYoutubeSearch(req, res) {
+app.post("/api/zapier/sms", async (req, res) => {
   try {
-    const q = String(req.query.q || "").trim();
-    if (!q) return res.json({ items: [] });
-
-    if (!YOUTUBE_API_KEY) {
-      return res.status(503).json({
-        errorCode: "YOUTUBE_KEY_MISSING",
-        error: "Missing YOUTUBE_API_KEY in backend env.",
-        items: [],
-      });
-    }
-
-    const cacheKey = q.toLowerCase();
-    const now = Date.now();
-    const cached = ytCache.get(cacheKey);
-    if (cached && cached.expiresAt > now) {
-      return res.json({ items: cached.items, cached: true });
-    }
-
-    const url = new URL("https://www.googleapis.com/youtube/v3/search");
-    url.searchParams.set("part", "snippet");
-    url.searchParams.set("type", "video");
-    url.searchParams.set("maxResults", "8");
-    url.searchParams.set("q", q);
-    url.searchParams.set("key", YOUTUBE_API_KEY);
-    url.searchParams.set("safeSearch", "strict");
-
-    const r = await axios.get(url.toString(), { timeout: 12000 });
-    const data = r.data || {};
-
-    const items = (data.items || [])
-      .map((x) => {
-        const id = x?.id?.videoId;
-        const sn = x?.snippet || {};
-        if (!id) return null;
-        return {
-          id,
-          title: sn.title || "Video",
-          thumb:
-            sn.thumbnails?.medium?.url ||
-            sn.thumbnails?.default?.url ||
-            "",
-          channelTitle: sn.channelTitle || "",
-          publishedAt: sn.publishedAt || "",
-        };
-      })
-      .filter(Boolean);
-
-    ytCache.set(cacheKey, { items, expiresAt: now + YT_CACHE_TTL_MS });
-    res.json({ items });
+    if (!ZAPIER_SMS_WEBHOOK_URL) return res.status(503).json({ error: "No Zapier URL" });
+    await axios.post(ZAPIER_SMS_WEBHOOK_URL, req.body);
+    res.json({ ok: true });
   } catch (e) {
-    console.error("[YouTube] search error:", e.message);
-    res.status(500).json({
-      errorCode: "YOUTUBE_SEARCH_ERROR",
-      error: e.message || "YouTube search failed",
-      items: [],
-    });
+    res.status(500).json({ error: e.message });
   }
-}
-
-app.get("/api/youtube/search", handleYoutubeSearch);
-app.get("/api/youtube-search", handleYoutubeSearch);
-
-/* ============================================================
-   11) ERROR HANDLING
-============================================================ */
-app.use((err, req, res, next) => {
-  console.error("[Error]", err);
-  res.status(500).json({
-    error: "Internal server error",
-    details: err.message,
-  });
 });
 
 /* ============================================================
-   12) START SERVER
+   9) YOUTUBE SEARCH
+============================================================ */
+const ytCache = new Map();
+app.get("/api/youtube/search", async (req, res) => {
+  try {
+    const q = req.query.q;
+    if (!q) return res.json({ items: [] });
+    if (!YOUTUBE_API_KEY) return res.status(503).json({ error: "No YT Key" });
+
+    // Simple cache
+    const cacheKey = q.toLowerCase();
+    if (ytCache.has(cacheKey)) return res.json({ items: ytCache.get(cacheKey) });
+
+    const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=5&q=${encodeURIComponent(q)}&key=${YOUTUBE_API_KEY}`;
+    const r = await axios.get(url);
+    
+    const items = (r.data.items || []).map(i => ({
+      id: i.id.videoId,
+      title: i.snippet.title,
+      thumbnail: i.snippet.thumbnails.medium.url
+    }));
+
+    ytCache.set(cacheKey, items);
+    res.json({ items });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ============================================================
+   START
 ============================================================ */
 app.listen(PORT, () => {
   console.log(`✅ Backend running on port ${PORT}`);
   console.log(`📍 URL: ${baseUrl}`);
-  console.log(`📞 TwiML Voice URL: ${baseUrl}/api/voice`);
-  console.log(`📧 Outlook callback URL: ${outlookRedirectUri()}`);
+  console.log(`📧 Outlook callback: ${outlookRedirectUri()}`);
 });
