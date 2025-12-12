@@ -7,11 +7,10 @@
  * FEATURES MAJEURES:
  * - CORS ultra-robuste (subdomains + dev)
  * - Health check / + /api/health
+ * - Version endpoint /api/version (debug Render deploy)
  * - Twilio Voice (JWT + TwiML)
  * - Monday.com (tickets: fetch / create / upsert / resolve)
  * - Cache TTL Monday
- * - Outlook OAuth + Graph API (folders / messages / send)
- * - Token refresh automatique
  * - Zapier SMS proxy (anti-CORS)
  * - Tidio config helper
  * - YouTube Search proxy (widget)
@@ -75,8 +74,7 @@ app.use(express.json({ limit: "1mb" }));
 1) ENV / BASE CONFIG
 ============================================================ */
 const PORT = process.env.PORT || 10000;
-const baseUrl =
-  process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+const baseUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 
 const {
   /* Twilio */
@@ -95,7 +93,7 @@ const {
   MONDAY_ITEMS_LIMIT,
   MONDAY_API_VERSION,
 
-  /* Outlook */
+  /* Outlook (non utilisé ici, conservé pour compat future) */
   OUTLOOK_CLIENT_ID,
   OUTLOOK_TENANT_ID,
   OUTLOOK_CLIENT_SECRET,
@@ -124,13 +122,47 @@ const TWILIO_ENABLED =
   !!TWILIO_TWIML_APP_SID;
 
 /* ============================================================
-2) HEALTH CHECKS
+1.1) BUILD STAMP / RENDER DEBUG
+============================================================ */
+const STARTED_AT = new Date().toISOString();
+
+// Render exposes some envs depending on config. We read safely.
+const BUILD = {
+  startedAt: STARTED_AT,
+  node: process.version,
+  baseUrl,
+  render: {
+    externalUrl: process.env.RENDER_EXTERNAL_URL || null,
+    serviceId: process.env.RENDER_SERVICE_ID || null,
+    instanceId: process.env.RENDER_INSTANCE_ID || null,
+    gitCommit: process.env.RENDER_GIT_COMMIT || null,
+    gitBranch: process.env.RENDER_GIT_BRANCH || null,
+  },
+  app: {
+    // Optional: you can set these in Render env manually if you want a stable marker.
+    buildTag: process.env.AFI_BUILD_TAG || null,
+  },
+};
+
+/* ============================================================
+2) HEALTH CHECKS + VERSION
 ============================================================ */
 app.get("/", (req, res) => {
   res.json({
     status: "AFI OPS Backend OK",
     timestamp: new Date().toISOString(),
     baseUrl,
+    build: BUILD,
+  });
+});
+
+// New: version endpoint for “Render ne se met plus à jour”
+app.get("/api/version", (req, res) => {
+  res.json({
+    ok: true,
+    service: "afi-ops-backend",
+    timestamp: new Date().toISOString(),
+    build: BUILD,
   });
 });
 
@@ -139,6 +171,7 @@ app.get("/api/health", (req, res) => {
     ok: true,
     timestamp: new Date().toISOString(),
     baseUrl,
+    build: BUILD,
     services: {
       twilio: TWILIO_ENABLED ? "ready" : "disabled",
       monday: MONDAY_TOKEN ? "ready" : "missing_token",
@@ -238,11 +271,7 @@ function mondayHeaders() {
 }
 
 async function mondayRequest(query, variables) {
-  return axios.post(
-    MONDAY_URL,
-    { query, variables },
-    { headers: mondayHeaders(), timeout: 15000 }
-  );
+  return axios.post(MONDAY_URL, { query, variables }, { headers: mondayHeaders(), timeout: 15000 });
 }
 
 const mondayCache = {
@@ -281,8 +310,7 @@ app.get("/api/monday/tickets", async (req, res) => {
       limit: MONDAY_LIMIT,
     });
 
-    const items =
-      r.data?.data?.boards?.[0]?.items_page?.items || [];
+    const items = r.data?.data?.boards?.[0]?.items_page?.items || [];
 
     const payload = { items };
     mondayCache.data = payload;
@@ -365,7 +393,7 @@ async function callOpenAI(instructions, input) {
   const r = await axios.post(
     "https://api.openai.com/v1/responses",
     { model: OPENAI_MODEL || "gpt-5", instructions, input },
-    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
+    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }, timeout: 30000 }
   );
   return r.data?.output_text || "";
 }
@@ -374,10 +402,7 @@ app.post("/api/gpt/analyze-ticket", async (req, res) => {
   if (!OPENAI_API_KEY) {
     return res.status(501).json({ error: "GPT disabled" });
   }
-  const text = await callOpenAI(
-    "Analyse SAV et retourne JSON.",
-    JSON.stringify(req.body)
-  );
+  const text = await callOpenAI("Analyse SAV et retourne JSON.", JSON.stringify(req.body));
   res.json({ ok: true, analysis: text });
 });
 
@@ -385,10 +410,7 @@ app.post("/api/gpt/generate-wrap", async (req, res) => {
   if (!OPENAI_API_KEY) {
     return res.status(501).json({ error: "GPT disabled" });
   }
-  const text = await callOpenAI(
-    "Génère un wrap SAV structuré.",
-    JSON.stringify(req.body)
-  );
+  const text = await callOpenAI("Génère un wrap SAV structuré.", JSON.stringify(req.body));
   res.json({ ok: true, wrap: text });
 });
 
@@ -405,7 +427,7 @@ app.get("/api/youtube/search", async (req, res) => {
   url.searchParams.set("type", "video");
   url.searchParams.set("maxResults", "8");
 
-  const r = await axios.get(url.toString());
+  const r = await axios.get(url.toString(), { timeout: 15000 });
   res.json({ items: r.data.items || [] });
 });
 
@@ -413,10 +435,11 @@ app.get("/api/youtube/search", async (req, res) => {
 9) ZAPIER SMS
 ============================================================ */
 app.post("/api/zapier/sms", async (req, res) => {
-  if (!ZAPIER_SMS_WEBHOOK_URL)
+  if (!ZAPIER_SMS_WEBHOOK_URL) {
     return res.status(503).json({ error: "Zapier webhook missing" });
+  }
 
-  await axios.post(ZAPIER_SMS_WEBHOOK_URL, req.body);
+  await axios.post(ZAPIER_SMS_WEBHOOK_URL, req.body, { timeout: 15000 });
   res.json({ ok: true });
 });
 
@@ -446,5 +469,9 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ AFI OPS Backend running on ${baseUrl}`);
+  console.log("✅ AFI OPS Backend boot");
+  console.log("   baseUrl:", baseUrl);
+  console.log("   startedAt:", STARTED_AT);
+  console.log("   render.gitCommit:", BUILD.render.gitCommit);
+  console.log("   render.instanceId:", BUILD.render.instanceId);
 });
