@@ -11,7 +11,7 @@
  *   - GET  /api/outlook/messages
  *
  * NOTES:
- * - Stockage tokens Outlook: in-memory (single agent). OK pour OPS.
+ * - Stockage tokens Outlook: fichier JSON (persistant entre redémarrages simples)
  * - CORS: robuste (codepen + domain + localhost)
  * ============================================================
  */
@@ -21,6 +21,7 @@ const twilio = require("twilio");
 const axios = require("axios");
 const cors = require("cors");
 const crypto = require("crypto");
+const fs = require("fs");
 require("dotenv").config();
 
 const app = express();
@@ -38,7 +39,6 @@ const allowedOrigins = [
 
 function isAllowed(origin) {
   if (!origin) return true;
-
   if (allowedOrigins.includes(origin)) return true;
   if (origin.endsWith(".cdpn.io") || origin.endsWith(".codepen.io")) return true;
 
@@ -67,7 +67,8 @@ app.use(express.json({ limit: "1mb" }));
 1) ENV / BASE CONFIG
 ============================================================ */
 const PORT = process.env.PORT || 10000;
-const baseUrl = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+const baseUrl =
+  process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 
 const {
   /* Twilio */
@@ -236,7 +237,9 @@ app.post("/api/voice", (req, res) => {
       callerId: TWILIO_PHONE_NUMBER,
       timeout: 30,
     });
-    /^[\d\+\-\(\) ]+$/.test(To) ? dial.number(To) : dial.client(To);
+    /^[\d\+\-\(\) ]+$/.test(To)
+      ? dial.number(To)
+      : dial.client(To);
   } else {
     response.say("Aucun destinataire spécifié.");
   }
@@ -264,7 +267,11 @@ function mondayHeaders() {
 }
 
 async function mondayRequest(query, variables) {
-  return axios.post(MONDAY_URL, { query, variables }, { headers: mondayHeaders(), timeout: 15000 });
+  return axios.post(
+    MONDAY_URL,
+    { query, variables },
+    { headers: mondayHeaders(), timeout: 15000 }
+  );
 }
 
 const mondayCache = { data: null, expiresAt: 0 };
@@ -300,7 +307,8 @@ app.get("/api/monday/tickets", async (req, res) => {
       limit: MONDAY_LIMIT,
     });
 
-    const items = r.data?.data?.boards?.[0]?.items_page?.items || [];
+    const items =
+      r.data?.data?.boards?.[0]?.items_page?.items || [];
 
     const payload = { items };
     mondayCache.data = payload;
@@ -368,7 +376,9 @@ app.post("/api/monday/resolve-ticket", async (req, res) => {
         change_simple_column_value(item_id: $itemId, board_id: ${DEFAULT_BOARD_ID}, column_id: "status", value: "Résolu") { id }
       }
     `;
-    await mondayRequest(mutation, { itemId: String(req.body.itemId) });
+    await mondayRequest(mutation, {
+      itemId: String(req.body.itemId),
+    });
     mondayCache.data = null;
     res.json({ ok: true });
   } catch (e) {
@@ -377,29 +387,51 @@ app.post("/api/monday/resolve-ticket", async (req, res) => {
 });
 
 /* ============================================================
-7) OUTLOOK – OAUTH2 + MICROSOFT GRAPH
+7) OUTLOOK – OAUTH2 + MICROSOFT GRAPH (FILE STORE)
 ============================================================ */
 
-/**
- * In-memory token store (single user / single agent).
- * If Render restarts -> reconnect needed. Acceptable for now.
- */
-const outlookStore = {
+const TOKEN_FILE = "./outlook-tokens.json";
+
+let outlookStore = {
   connected: false,
   access_token: null,
   refresh_token: null,
-  expires_at: 0, // epoch ms
+  expires_at: 0,
   last_error: null,
   last_connected_at: null,
+  _pending_state: null,
 };
 
+try {
+  if (fs.existsSync(TOKEN_FILE)) {
+    outlookStore = JSON.parse(fs.readFileSync(TOKEN_FILE, "utf8"));
+    console.log("✅ Outlook: tokens restaurés depuis fichier");
+  }
+} catch (e) {
+  console.error("⚠️ Outlook: erreur lecture tokens", e);
+}
+
+function saveOutlookTokens() {
+  try {
+    fs.writeFileSync(
+      TOKEN_FILE,
+      JSON.stringify(outlookStore, null, 2)
+    );
+  } catch (e) {
+    console.error("⚠️ Outlook: erreur sauvegarde tokens", e);
+  }
+}
+
 function outlookTokenEndpoint() {
-  // Tenant-specific endpoint
-  return `https://login.microsoftonline.com/${encodeURIComponent(OUTLOOK_TENANT_ID)}/oauth2/v2.0/token`;
+  return `https://login.microsoftonline.com/${encodeURIComponent(
+    OUTLOOK_TENANT_ID
+  )}/oauth2/v2.0/token`;
 }
 
 function outlookAuthorizeEndpoint() {
-  return `https://login.microsoftonline.com/${encodeURIComponent(OUTLOOK_TENANT_ID)}/oauth2/v2.0/authorize`;
+  return `https://login.microsoftonline.com/${encodeURIComponent(
+    OUTLOOK_TENANT_ID
+  )}/oauth2/v2.0/authorize`;
 }
 
 function nowMs() {
@@ -407,20 +439,16 @@ function nowMs() {
 }
 
 function isOutlookTokenValid() {
-  return !!outlookStore.access_token && outlookStore.expires_at > nowMs() + 60_000; // 60s margin
+  return (
+    !!outlookStore.access_token &&
+    outlookStore.expires_at > nowMs() + 60_000
+  );
 }
 
 async function refreshOutlookTokenIfNeeded() {
   if (!OUTLOOK_CONFIGURED) return null;
-
   if (isOutlookTokenValid()) return outlookStore.access_token;
-
-  if (!outlookStore.refresh_token) {
-    outlookStore.connected = false;
-    outlookStore.access_token = null;
-    outlookStore.expires_at = 0;
-    return null;
-  }
+  if (!outlookStore.refresh_token) return null;
 
   try {
     const params = new URLSearchParams();
@@ -431,27 +459,35 @@ async function refreshOutlookTokenIfNeeded() {
     params.set("redirect_uri", OUTLOOK_REDIRECT_URI);
     params.set("scope", "offline_access Mail.Read User.Read");
 
-    const r = await axios.post(outlookTokenEndpoint(), params.toString(), {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      timeout: 15000,
-    });
+    const r = await axios.post(
+      outlookTokenEndpoint(),
+      params.toString(),
+      {
+        headers: {
+          "Content-Type":
+            "application/x-www-form-urlencoded",
+        },
+        timeout: 15000,
+      }
+    );
 
     const data = r.data || {};
-    const expiresIn = Number(data.expires_in || 0);
-
     outlookStore.access_token = data.access_token || null;
-    outlookStore.refresh_token = data.refresh_token || outlookStore.refresh_token; // sometimes rotated
-    outlookStore.expires_at = nowMs() + expiresIn * 1000;
+    if (data.refresh_token) {
+      outlookStore.refresh_token = data.refresh_token;
+    }
+    outlookStore.expires_at =
+      nowMs() + Number(data.expires_in || 0) * 1000;
     outlookStore.connected = !!outlookStore.access_token;
     outlookStore.last_error = null;
-    if (outlookStore.connected) outlookStore.last_connected_at = new Date().toISOString();
+    outlookStore.last_connected_at =
+      new Date().toISOString();
 
+    saveOutlookTokens();
     return outlookStore.access_token;
   } catch (e) {
-    outlookStore.last_error = e?.response?.data || e?.message || "refresh_failed";
-    outlookStore.connected = false;
-    outlookStore.access_token = null;
-    outlookStore.expires_at = 0;
+    outlookStore.last_error =
+      e?.response?.data || e?.message || "refresh_failed";
     return null;
   }
 }
@@ -460,7 +496,8 @@ function makeStateToken() {
   return crypto.randomBytes(18).toString("hex");
 }
 
-// GET /api/outlook-status
+/* ================= OUTLOOK ROUTES ================= */
+
 app.get("/api/outlook-status", async (req, res) => {
   if (!OUTLOOK_CONFIGURED) {
     return res.json({
@@ -471,7 +508,6 @@ app.get("/api/outlook-status", async (req, res) => {
     });
   }
 
-  // refresh if needed
   await refreshOutlookTokenIfNeeded();
 
   res.json({
@@ -483,7 +519,6 @@ app.get("/api/outlook-status", async (req, res) => {
   });
 });
 
-// POST /api/outlook-auth -> returns authUrl
 app.post("/api/outlook-auth", (req, res) => {
   if (!OUTLOOK_CONFIGURED) {
     return res.status(503).json({
@@ -494,22 +529,24 @@ app.post("/api/outlook-auth", (req, res) => {
   }
 
   const state = makeStateToken();
-  // Store the state in memory for basic CSRF guard (single agent).
   outlookStore._pending_state = state;
+  saveOutlookTokens();
 
   const url = new URL(outlookAuthorizeEndpoint());
   url.searchParams.set("client_id", OUTLOOK_CLIENT_ID);
   url.searchParams.set("response_type", "code");
   url.searchParams.set("redirect_uri", OUTLOOK_REDIRECT_URI);
   url.searchParams.set("response_mode", "query");
-  url.searchParams.set("scope", "offline_access Mail.Read User.Read");
+  url.searchParams.set(
+    "scope",
+    "offline_access Mail.Read User.Read"
+  );
   url.searchParams.set("state", state);
-  url.searchParams.set("prompt", "select_account"); // can switch to "consent" on first run if needed
+  url.searchParams.set("prompt", "select_account");
 
   res.json({ ok: true, authUrl: url.toString() });
 });
 
-// GET /api/outlook/callback
 app.get("/api/outlook/callback", async (req, res) => {
   const code = req.query.code;
   const state = req.query.state;
@@ -517,26 +554,40 @@ app.get("/api/outlook/callback", async (req, res) => {
   const errDesc = req.query.error_description;
 
   if (err) {
-    outlookStore.last_error = { error: err, error_description: errDesc || null };
+    outlookStore.last_error = {
+      error: err,
+      error_description: errDesc || null,
+    };
     outlookStore.connected = false;
+    saveOutlookTokens();
     return res
       .status(400)
-      .send(`<html><body><pre>Outlook OAuth error: ${escapeHtml(err)}\n${escapeHtml(errDesc || "")}</pre></body></html>`);
-  }
-
-  if (!OUTLOOK_CONFIGURED) {
-    return res.status(503).send("<html><body><pre>Outlook not configured.</pre></body></html>");
+      .send(
+        `<html><body><pre>Outlook OAuth error: ${escapeHtml(
+          err
+        )}\n${escapeHtml(
+          errDesc || ""
+        )}</pre></body></html>`
+      );
   }
 
   if (!code) {
-    return res.status(400).send("<html><body><pre>Missing code.</pre></body></html>");
+    return res
+      .status(400)
+      .send("<html><body><pre>Missing code.</pre></body></html>");
   }
 
-  // Basic state check (single agent). If absent, still proceed but flag.
-  if (outlookStore._pending_state && state && outlookStore._pending_state !== state) {
+  if (
+    outlookStore._pending_state &&
+    state &&
+    outlookStore._pending_state !== state
+  ) {
     outlookStore.last_error = { error: "STATE_MISMATCH" };
     outlookStore.connected = false;
-    return res.status(400).send("<html><body><pre>State mismatch.</pre></body></html>");
+    saveOutlookTokens();
+    return res
+      .status(400)
+      .send("<html><body><pre>State mismatch.</pre></body></html>");
   }
 
   try {
@@ -546,60 +597,79 @@ app.get("/api/outlook/callback", async (req, res) => {
     params.set("grant_type", "authorization_code");
     params.set("code", String(code));
     params.set("redirect_uri", OUTLOOK_REDIRECT_URI);
-    params.set("scope", "offline_access Mail.Read User.Read");
+    params.set(
+      "scope",
+      "offline_access Mail.Read User.Read"
+    );
 
-    const r = await axios.post(outlookTokenEndpoint(), params.toString(), {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      timeout: 15000,
-    });
+    const r = await axios.post(
+      outlookTokenEndpoint(),
+      params.toString(),
+      {
+        headers: {
+          "Content-Type":
+            "application/x-www-form-urlencoded",
+        },
+        timeout: 15000,
+      }
+    );
 
     const data = r.data || {};
-    const expiresIn = Number(data.expires_in || 0);
-
     outlookStore.access_token = data.access_token || null;
     outlookStore.refresh_token = data.refresh_token || null;
-    outlookStore.expires_at = nowMs() + expiresIn * 1000;
+    outlookStore.expires_at =
+      nowMs() + Number(data.expires_in || 0) * 1000;
     outlookStore.connected = !!outlookStore.access_token;
     outlookStore.last_error = null;
-    outlookStore.last_connected_at = new Date().toISOString();
+    outlookStore.last_connected_at =
+      new Date().toISOString();
     outlookStore._pending_state = null;
 
-    // Return an HTML page that notifies the opener window, then closes itself.
+    saveOutlookTokens();
+
     res.send(`
       <html>
-        <head><meta charset="utf-8" /></head>
-        <body style="font-family:system-ui; padding:16px">
+        <body style="font-family:system-ui;padding:16px">
           <h3>Outlook connecté ✅</h3>
-          <p>Vous pouvez fermer cette fenêtre.</p>
           <script>
             try {
               if (window.opener) {
                 window.opener.postMessage({ type: "OUTLOOK_CONNECTED" }, "*");
               }
-            } catch (e) {}
-            setTimeout(() => { try { window.close(); } catch(e) {} }, 250);
+            } catch(e){}
+            setTimeout(() => window.close(), 250);
           </script>
         </body>
       </html>
     `);
   } catch (e) {
-    const details = e?.response?.data || e?.message || "token_exchange_failed";
-    outlookStore.last_error = details;
+    outlookStore.last_error =
+      e?.response?.data || e?.message || "token_exchange_failed";
     outlookStore.connected = false;
     outlookStore.access_token = null;
     outlookStore.refresh_token = null;
     outlookStore.expires_at = 0;
+    saveOutlookTokens();
 
     res
       .status(500)
-      .send(`<html><body><pre>Token exchange failed:\n${escapeHtml(JSON.stringify(details, null, 2))}</pre></body></html>`);
+      .send(
+        `<html><body><pre>Token exchange failed:\n${escapeHtml(
+          JSON.stringify(
+            outlookStore.last_error,
+            null,
+            2
+          )
+        )}</pre></body></html>`
+      );
   }
 });
 
-// GET /api/outlook/messages
 app.get("/api/outlook/messages", async (req, res) => {
   if (!OUTLOOK_CONFIGURED) {
-    return res.status(503).json({ ok: false, error: "OUTLOOK_NOT_CONFIGURED" });
+    return res
+      .status(503)
+      .json({ ok: false, error: "OUTLOOK_NOT_CONFIGURED" });
   }
 
   const token = await refreshOutlookTokenIfNeeded();
@@ -612,10 +682,18 @@ app.get("/api/outlook/messages", async (req, res) => {
   }
 
   try {
-    const top = Math.max(5, Math.min(50, Number(req.query.top || 25)));
-    const graphUrl = new URL("https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages");
+    const top = Math.max(
+      5,
+      Math.min(50, Number(req.query.top || 25))
+    );
+    const graphUrl = new URL(
+      "https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages"
+    );
     graphUrl.searchParams.set("$top", String(top));
-    graphUrl.searchParams.set("$orderby", "receivedDateTime DESC");
+    graphUrl.searchParams.set(
+      "$orderby",
+      "receivedDateTime DESC"
+    );
     graphUrl.searchParams.set(
       "$select",
       "id,subject,receivedDateTime,from,bodyPreview,hasAttachments,importance,isRead"
@@ -626,20 +704,24 @@ app.get("/api/outlook/messages", async (req, res) => {
       timeout: 15000,
     });
 
-    const messages = r.data?.value || [];
-    res.json({ ok: true, messages });
+    res.json({ ok: true, messages: r.data?.value || [] });
   } catch (e) {
     const status = e?.response?.status || 500;
-    const data = e?.response?.data || { error: e?.message || "graph_error" };
+    const data =
+      e?.response?.data || {
+        error: e?.message || "graph_error",
+      };
 
-    // If token got revoked/expired in a hard way
     if (status === 401 || status === 403) {
       outlookStore.connected = false;
       outlookStore.access_token = null;
       outlookStore.expires_at = 0;
+      saveOutlookTokens();
     }
 
-    res.status(status).json({ ok: false, error: "OUTLOOK_GRAPH_ERROR", details: data });
+    res
+      .status(status)
+      .json({ ok: false, error: "OUTLOOK_GRAPH_ERROR", details: data });
   }
 });
 
@@ -659,7 +741,10 @@ app.post("/api/gpt/analyze-ticket", async (req, res) => {
   if (!OPENAI_API_KEY) {
     return res.status(501).json({ error: "GPT disabled" });
   }
-  const text = await callOpenAI("Analyse SAV et retourne JSON.", JSON.stringify(req.body));
+  const text = await callOpenAI(
+    "Analyse SAV et retourne JSON.",
+    JSON.stringify(req.body)
+  );
   res.json({ ok: true, analysis: text });
 });
 
@@ -667,7 +752,10 @@ app.post("/api/gpt/generate-wrap", async (req, res) => {
   if (!OPENAI_API_KEY) {
     return res.status(501).json({ error: "GPT disabled" });
   }
-  const text = await callOpenAI("Génère un wrap SAV structuré.", JSON.stringify(req.body));
+  const text = await callOpenAI(
+    "Génère un wrap SAV structuré.",
+    JSON.stringify(req.body)
+  );
   res.json({ ok: true, wrap: text });
 });
 
@@ -677,14 +765,18 @@ app.post("/api/gpt/generate-wrap", async (req, res) => {
 app.get("/api/youtube/search", async (req, res) => {
   if (!YOUTUBE_API_KEY) return res.json({ items: [] });
 
-  const url = new URL("https://www.googleapis.com/youtube/v3/search");
+  const url = new URL(
+    "https://www.googleapis.com/youtube/v3/search"
+  );
   url.searchParams.set("part", "snippet");
   url.searchParams.set("q", req.query.q || "");
   url.searchParams.set("key", YOUTUBE_API_KEY);
   url.searchParams.set("type", "video");
   url.searchParams.set("maxResults", "8");
 
-  const r = await axios.get(url.toString(), { timeout: 15000 });
+  const r = await axios.get(url.toString(), {
+    timeout: 15000,
+  });
   res.json({ items: r.data.items || [] });
 });
 
@@ -693,10 +785,14 @@ app.get("/api/youtube/search", async (req, res) => {
 ============================================================ */
 app.post("/api/zapier/sms", async (req, res) => {
   if (!ZAPIER_SMS_WEBHOOK_URL) {
-    return res.status(503).json({ error: "Zapier webhook missing" });
+    return res
+      .status(503)
+      .json({ error: "Zapier webhook missing" });
   }
 
-  await axios.post(ZAPIER_SMS_WEBHOOK_URL, req.body, { timeout: 15000 });
+  await axios.post(ZAPIER_SMS_WEBHOOK_URL, req.body, {
+    timeout: 15000,
+  });
   res.json({ ok: true });
 });
 
