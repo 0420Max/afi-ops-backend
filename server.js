@@ -7,6 +7,7 @@
  * - Add /api/tickets/:id PATCH (status/assignee/group/column_values)
  * - Keep existing /api/monday/* endpoints
  * - Add urlencoded middleware (Twilio sends form-encoded)
+ * - Outlook: folders + message detail + folderId support on /api/outlook/messages
  * ============================================================
  */
 
@@ -280,7 +281,6 @@ function colMap(item) {
   for (const cv of cvs) {
     const key = (cv?.column?.title || cv?.id || "").toString().toLowerCase();
     out[key] = cv?.text ?? "";
-    // aussi index par id exact
     if (cv?.id) out[`id:${cv.id}`] = cv?.text ?? "";
   }
   return out;
@@ -303,7 +303,6 @@ function normalizeTicketFromMondayItem(item) {
     pick(cols, ["etat", "state"]) ||
     "open";
 
-  // ton UI attend "urgent/open/wait/closed" souvent, on map un peu
   const statusNorm = (() => {
     const s = statusText.toLowerCase();
     if (s.includes("urgent")) return "urgent";
@@ -320,7 +319,6 @@ function normalizeTicketFromMondayItem(item) {
   const email = pick(cols, ["courriel", "email", "e-mail"]);
   const location = pick(cols, ["adresse", "address", "ville", "city", "localisation", "location"]);
 
-  // tags: si tu as une colonne "tags/labels"
   const tagsRaw = pick(cols, ["tags", "labels", "étiquettes", "etiquettes"]);
   const tags = tagsRaw ? tagsRaw.split(/[,\|]/).map(x => x.trim()).filter(Boolean) : [];
 
@@ -336,7 +334,6 @@ function normalizeTicketFromMondayItem(item) {
     email,
     location,
     tags,
-    // useful metadata
     monday: {
       boardId: DEFAULT_BOARD_ID,
       group: item?.group || null,
@@ -512,11 +509,6 @@ app.post("/api/monday/resolve-ticket", async (req, res) => {
 
 /* ============================================================
 6.1) ✅ PATCH compat – /api/tickets/:id
-   Body accepted:
-   - status: "Urgent" / "Open" / etc
-   - groupId: "topics" / another group id
-   - assigneeId: number (Monday user id)
-   - column_values: object (direct pass)
 ============================================================ */
 app.patch("/api/tickets/:id", async (req, res) => {
   const itemId = String(req.params.id || "");
@@ -525,7 +517,6 @@ app.patch("/api/tickets/:id", async (req, res) => {
   try {
     const ops = [];
 
-    // 1) direct column_values passthrough
     if (req.body?.column_values && typeof req.body.column_values === "object") {
       const mutation = `
         mutation ($itemId: ID!, $cols: JSON!) {
@@ -535,7 +526,6 @@ app.patch("/api/tickets/:id", async (req, res) => {
       ops.push(mondayRequest(mutation, { itemId, cols: JSON.stringify(req.body.column_values) }));
     }
 
-    // 2) status convenience
     if (req.body?.status) {
       const mutation = `
         mutation ($itemId: ID!, $val: String!) {
@@ -545,7 +535,6 @@ app.patch("/api/tickets/:id", async (req, res) => {
       ops.push(mondayRequest(mutation, { itemId, val: String(req.body.status) }));
     }
 
-    // 3) assignee convenience (requires assigneeId)
     if (req.body?.assigneeId) {
       const assigneeId = Number(req.body.assigneeId);
       if (!Number.isFinite(assigneeId)) {
@@ -562,7 +551,6 @@ app.patch("/api/tickets/:id", async (req, res) => {
       ops.push(mondayRequest(mutation, { itemId, cols: JSON.stringify(cols) }));
     }
 
-    // 4) move group convenience
     if (req.body?.groupId) {
       const groupId = String(req.body.groupId);
       const mutation = `
@@ -798,6 +786,9 @@ app.get("/api/outlook/callback", async (req, res) => {
   }
 });
 
+/* ============================================================
+7) OUTLOOK – MESSAGES (upgrade: folderId support)
+============================================================ */
 app.get("/api/outlook/messages", async (req, res) => {
   if (!OUTLOOK_CONFIGURED) {
     return res.status(503).json({ ok: false, error: "OUTLOOK_NOT_CONFIGURED" });
@@ -814,10 +805,19 @@ app.get("/api/outlook/messages", async (req, res) => {
 
   try {
     const top = Math.max(5, Math.min(50, Number(req.query.top || 25)));
-    const graphUrl = new URL("https://graph.microsoft.com/v1.0/me/mailFolders/Inbox/messages");
+    const folderId = req.query.folderId || "Inbox";
+
+    const basePath = folderId === "Inbox"
+      ? "me/mailFolders/Inbox/messages"
+      : `me/mailFolders/${encodeURIComponent(folderId)}/messages`;
+
+    const graphUrl = new URL(`https://graph.microsoft.com/v1.0/${basePath}`);
     graphUrl.searchParams.set("$top", String(top));
     graphUrl.searchParams.set("$orderby", "receivedDateTime DESC");
-    graphUrl.searchParams.set("$select", "id,subject,receivedDateTime,from,bodyPreview,hasAttachments,importance,isRead");
+    graphUrl.searchParams.set(
+      "$select",
+      "id,subject,receivedDateTime,from,bodyPreview,hasAttachments,importance,isRead"
+    );
 
     const r = await axios.get(graphUrl.toString(), {
       headers: { Authorization: `Bearer ${token}` },
@@ -837,6 +837,96 @@ app.get("/api/outlook/messages", async (req, res) => {
     }
 
     res.status(status).json({ ok: false, error: "OUTLOOK_GRAPH_ERROR", details: data });
+  }
+});
+
+// ============================================================
+// 7.1) OUTLOOK – FOLDERS + MESSAGE DETAIL
+// ============================================================
+
+// Helper Graph générique
+async function callGraph(token, url) {
+  const r = await axios.get(url, {
+    headers: { Authorization: `Bearer ${token}` },
+    timeout: 15000,
+  });
+  return r.data || {};
+}
+
+// Liste des dossiers (colonne 1)
+app.get("/api/outlook/folders", async (req, res) => {
+  if (!OUTLOOK_CONFIGURED) {
+    return res.status(503).json({ ok: false, error: "OUTLOOK_NOT_CONFIGURED" });
+  }
+
+  const token = await refreshOutlookTokenIfNeeded();
+  if (!token) {
+    return res.status(401).json({
+      ok: false,
+      error: "OUTLOOK_NOT_CONNECTED",
+      message: "Connect Outlook first.",
+    });
+  }
+
+  try {
+    const graphUrl = new URL("https://graph.microsoft.com/v1.0/me/mailFolders");
+    graphUrl.searchParams.set("$top", "50");
+    graphUrl.searchParams.set(
+      "$select",
+      "id,displayName,parentFolderId,childFolderCount,unreadItemCount,totalItemCount"
+    );
+
+    const data = await callGraph(token, graphUrl.toString());
+    res.json({
+      ok: true,
+      folders: data.value || [],
+    });
+  } catch (e) {
+    const status = e?.response?.status || 500;
+    const details = e?.response?.data || { error: e?.message || "graph_error" };
+    res.status(status).json({ ok: false, error: "OUTLOOK_GRAPH_ERROR", details });
+  }
+});
+
+// Détail d'un message (colonne 3)
+app.get("/api/outlook/message/:id", async (req, res) => {
+  if (!OUTLOOK_CONFIGURED) {
+    return res.status(503).json({ ok: false, error: "OUTLOOK_NOT_CONFIGURED" });
+  }
+
+  const token = await refreshOutlookTokenIfNeeded();
+  if (!token) {
+    return res.status(401).json({
+      ok: false,
+      error: "OUTLOOK_NOT_CONNECTED",
+      message: "Connect Outlook first.",
+    });
+  }
+
+  const msgId = String(req.params.id || "").trim();
+  if (!msgId) {
+    return res.status(400).json({ ok: false, error: "MISSING_MESSAGE_ID" });
+  }
+
+  try {
+    const graphUrl = new URL(`https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(msgId)}`);
+    graphUrl.searchParams.set(
+      "$select",
+      "id,subject,from,toRecipients,ccRecipients,replyTo,receivedDateTime,hasAttachments,importance,isRead,body"
+    );
+
+    const data = await callGraph(token, graphUrl.toString());
+    res.json({ ok: true, message: data });
+  } catch (e) {
+    const status = e?.response?.status || 500;
+    const details = e?.response?.data || { error: e?.message || "graph_error" };
+    if (status === 401 || status === 403) {
+      outlookStore.connected = false;
+      outlookStore.access_token = null;
+      outlookStore.expires_at = 0;
+      saveOutlookTokens();
+    }
+    res.status(status).json({ ok: false, error: "OUTLOOK_GRAPH_ERROR", details });
   }
 });
 
