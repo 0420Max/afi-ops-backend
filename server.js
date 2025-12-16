@@ -8,6 +8,13 @@
  * - Keep existing /api/monday/* endpoints
  * - Add urlencoded middleware (Twilio sends form-encoded)
  * - Outlook: folders + message detail + folderId support on /api/outlook/messages
+ *
+ * Patch injected (safe, non-breaking):
+ * - Add /api/monday/tickets-normalized (multi-board, exact fields for OPS Map)
+ *   -> returns: id, boardId, title, address, date, status, assignee, group
+ *   -> uses ENV: MONDAY_BOARD_SERVICES, MONDAY_BOARD_LIVRAISONS,
+ *               MONDAY_COL_ADDRESS, MONDAY_COL_DATE
+ * - Optional ALLOWED_ORIGINS merged into CORS whitelist
  * ============================================================
  */
 
@@ -22,15 +29,22 @@ require("dotenv").config();
 const app = express();
 
 /* ============================================================
-0) CORS FIX – ULTRA ROBUSTE
+0) CORS FIX – ULTRA ROBUSTE (with optional ALLOWED_ORIGINS merge)
 ============================================================ */
-const allowedOrigins = [
+const defaultOrigins = [
   "https://cdpn.io",
   "https://codepen.io",
   "https://afi-ops.ca",
   "http://localhost:3000",
   "http://localhost:5173",
 ];
+
+const envOrigins = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const allowedOrigins = [...new Set([...defaultOrigins, ...envOrigins])];
 
 function isAllowed(origin) {
   if (!origin) return true;
@@ -85,6 +99,12 @@ const {
   // Optional column ids for PATCH convenience
   MONDAY_STATUS_COLUMN_ID,
   MONDAY_ASSIGNEE_COLUMN_ID,
+
+  /* Monday Multi-board normalized (OPS Map) */
+  MONDAY_BOARD_SERVICES,
+  MONDAY_BOARD_LIVRAISONS,
+  MONDAY_COL_ADDRESS,
+  MONDAY_COL_DATE,
 
   /* Outlook */
   OUTLOOK_CLIENT_ID,
@@ -180,6 +200,7 @@ app.get("/api/health", (req, res) => {
       zapier: ZAPIER_SMS_WEBHOOK_URL ? "ready" : "missing_webhook",
       gpt: OPENAI_API_KEY ? "ready" : "disabled",
       transcript: "poc_safe",
+      mondayMap: MONDAY_BOARD_SERVICES && MONDAY_BOARD_LIVRAISONS ? "configured" : "not_configured",
     },
   });
 });
@@ -296,7 +317,11 @@ function pick(cols, candidates) {
 
 function normalizeTicketFromMondayItem(item) {
   const cols = colMap(item);
-  const createdAt = item?.created_at ? Date.parse(item.created_at) : (item?.updated_at ? Date.parse(item.updated_at) : Date.now());
+  const createdAt = item?.created_at
+    ? Date.parse(item.created_at)
+    : item?.updated_at
+    ? Date.parse(item.updated_at)
+    : Date.now();
 
   const statusText =
     pick(cols, ["status", `id:${STATUS_COL}`, "statut"]) ||
@@ -422,6 +447,148 @@ app.get("/api/monday/tickets", async (req, res) => {
       });
     }
     res.status(500).json({ error: e.message });
+  }
+});
+
+/* ============================================================
+5.0) ✅ PATCH (non-breaking): /api/monday/tickets-normalized
+     Multi-board, exact fields for OPS Map
+============================================================ */
+function mustEnv(name) {
+  const v = process.env[name];
+  if (!v) {
+    const err = new Error(`Missing ENV: ${name}`);
+    err.code = "MISSING_ENV";
+    err.envName = name;
+    throw err;
+  }
+  return v;
+}
+
+function pickColTextById(cols, id) {
+  const c = (cols || []).find((x) => x?.id === id);
+  return (c?.text || "").toString();
+}
+
+function pickLikelyById(cols, candidates) {
+  for (const id of candidates) {
+    const c = (cols || []).find((x) => x?.id === id);
+    if (c && ((c.text && String(c.text).trim()) || c.value)) return (c.text || "").toString();
+  }
+  return "";
+}
+
+function normalizeTicketForOpsMap({ item, boardId, addressColId, dateColId }) {
+  const cols = item?.column_values || [];
+  const address = pickColTextById(cols, addressColId).trim();
+  const date = pickColTextById(cols, dateColId).trim();
+
+  const status = pickLikelyById(cols, ["status", "statut", "status_1", "status0"]).trim();
+  const assignee = pickLikelyById(cols, ["people", "person", "assignee", "owner", "responsable"]).trim();
+
+  const group = item?.group?.title || item?.group?.id || "";
+
+  return {
+    id: String(item?.id || ""),
+    boardId: String(boardId || ""),
+    title: item?.name || "",
+    address,
+    date,
+    status,
+    assignee,
+    group,
+  };
+}
+
+app.get("/api/monday/tickets-normalized", async (req, res) => {
+  try {
+    // Validate env required for this endpoint only
+    mustEnv("MONDAY_TOKEN");
+    const boardServices = mustEnv("MONDAY_BOARD_SERVICES");
+    const boardLivraisons = mustEnv("MONDAY_BOARD_LIVRAISONS");
+    const addressColId = mustEnv("MONDAY_COL_ADDRESS");
+    const dateColId = mustEnv("MONDAY_COL_DATE");
+
+    const scope = String(req.query.scope || "all").toLowerCase();
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit || "200", 10)));
+
+    const boardIds =
+      scope === "services"
+        ? [boardServices]
+        : scope === "livraisons"
+        ? [boardLivraisons]
+        : [boardServices, boardLivraisons];
+
+    const query = `
+      query ($boardIds: [ID!], $limit: Int!) {
+        boards(ids: $boardIds) {
+          id
+          name
+          items_page(limit: $limit) {
+            items {
+              id
+              name
+              group { id title }
+              column_values { id text value }
+            }
+          }
+        }
+      }
+    `;
+
+    const r = await mondayRequest(query, { boardIds, limit });
+
+    if (r.data?.errors?.length) {
+      return res.status(500).json({ ok: false, errors: r.data.errors });
+    }
+
+    const boards = r.data?.data?.boards || [];
+    const tickets = [];
+
+    for (const b of boards) {
+      const items = b.items_page?.items || [];
+      for (const item of items) {
+        tickets.push(
+          normalizeTicketForOpsMap({
+            item,
+            boardId: b.id,
+            addressColId,
+            dateColId,
+          })
+        );
+      }
+    }
+
+    tickets.sort((a, b) => {
+      const da = a.date || "";
+      const db = b.date || "";
+      if (da !== db) return da.localeCompare(db);
+      return (a.title || "").localeCompare(b.title || "");
+    });
+
+    res.json({
+      ok: true,
+      scope,
+      count: tickets.length,
+      tickets,
+    });
+  } catch (e) {
+    if (e.code === "MONDAY_TOKEN_MISSING") {
+      return res.status(503).json({
+        ok: false,
+        errorCode: "MONDAY_TOKEN_MISSING",
+        message: "Missing MONDAY_TOKEN in env.",
+      });
+    }
+    if (e.code === "MISSING_ENV") {
+      return res.status(500).json({
+        ok: false,
+        errorCode: "MISSING_ENV",
+        message: e.message,
+        env: e.envName || null,
+      });
+    }
+    res.status(500).json({ ok: false, error: e.message || String(e) });
   }
 });
 
