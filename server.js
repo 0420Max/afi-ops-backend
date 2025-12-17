@@ -1243,9 +1243,9 @@ app.get("/api/outlook/folders", async (req, res) => {
     const graphUrl = new URL("https://graph.microsoft.com/v1.0/me/mailFolders");
     graphUrl.searchParams.set("$top", "50");
     graphUrl.searchParams.set(
-      "$select",
-      "id,displayName,parentFolderId,childFolderCount,unreadItemCount,totalItemCount"
-    understanding
+  "$select",
+  "id,displayName,parentFolderId,childFolderCount,unreadItemCount,totalItemCount"
+);
 
     const data = await callGraph(token, graphUrl.toString());
     res.json({
