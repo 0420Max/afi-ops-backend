@@ -2,19 +2,16 @@
  * ============================================================
  * AFI OPS – Backend Central (Render / Local)
  * ============================================================
- * Fixes:
- * - Add /api/tickets (alias -> Monday tickets, normalized)
- * - Add /api/tickets/:id PATCH (status/assignee/group/column_values)
- * - Keep existing /api/monday/* endpoints
- * - Add urlencoded middleware (Twilio sends form-encoded)
- * - Outlook: folders + message detail + folderId support on /api/outlook/messages
+ * Added (Twilio Conversations Chat/SMS):
+ * - POST /twilio/conversations-webhook (inbound events)
+ * - GET  /api/conversations (list conversations)
+ * - GET  /api/conversations/:sid/messages (list messages)
+ * - POST /api/conversations/:sid/messages (send message)
+ * - POST /api/conversations/start (create conversation + add sms participant)
  *
- * Patch injected (safe, non-breaking):
- * - Add /api/monday/tickets-normalized (multi-board, exact fields for OPS Map)
- *   -> returns: id, boardId, title, address, date, status, assignee, group
- *   -> uses ENV: MONDAY_BOARD_SERVICES, MONDAY_BOARD_LIVRAISONS,
- *               MONDAY_COL_ADDRESS, MONDAY_COL_DATE
- * - Optional ALLOWED_ORIGINS merged into CORS whitelist
+ * Notes:
+ * - Webhook signature validation uses TWILIO_AUTH_TOKEN (recommended).
+ *   If missing, webhook is accepted without signature validation (less secure).
  * ============================================================
  */
 
@@ -71,7 +68,7 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: false })); // ✅ Twilio webhooks
+app.use(express.urlencoded({ extended: false })); // ✅ Twilio webhooks (form-encoded)
 
 /* ============================================================
 1) ENV / BASE CONFIG
@@ -87,6 +84,8 @@ const {
   TWILIO_TWIML_APP_SID,
   TWILIO_PHONE_NUMBER,
   TWILIO_TOKEN_TTL,
+  TWILIO_AUTH_TOKEN, // ✅ recommended for webhook signature validation
+  TWILIO_CONVERSATIONS_SERVICE_SID, // ✅ ISxxxx (AFI_OPS Service SID)
 
   /* Monday */
   MONDAY_TOKEN,
@@ -136,6 +135,12 @@ const TWILIO_ENABLED =
   !!TWILIO_API_KEY &&
   !!TWILIO_API_SECRET &&
   !!TWILIO_TWIML_APP_SID;
+
+const TWILIO_CONVERSATIONS_ENABLED =
+  !!TWILIO_ACCOUNT_SID &&
+  !!TWILIO_API_KEY &&
+  !!TWILIO_API_SECRET &&
+  !!TWILIO_CONVERSATIONS_SERVICE_SID;
 
 const OUTLOOK_CONFIGURED =
   !!OUTLOOK_CLIENT_ID &&
@@ -193,6 +198,7 @@ app.get("/api/health", (req, res) => {
     build: BUILD,
     services: {
       twilio: TWILIO_ENABLED ? "ready" : "disabled",
+      twilioConversations: TWILIO_CONVERSATIONS_ENABLED ? "ready" : "missing_env",
       monday: MONDAY_TOKEN ? "ready" : "missing_token",
       outlook: OUTLOOK_CONFIGURED ? "configured" : "not_configured",
       tidio: TIDIO_PROJECT_ID ? "ready" : "not_configured",
@@ -200,13 +206,14 @@ app.get("/api/health", (req, res) => {
       zapier: ZAPIER_SMS_WEBHOOK_URL ? "ready" : "missing_webhook",
       gpt: OPENAI_API_KEY ? "ready" : "disabled",
       transcript: "poc_safe",
-      mondayMap: MONDAY_BOARD_SERVICES && MONDAY_BOARD_LIVRAISONS ? "configured" : "not_configured",
+      mondayMap:
+        MONDAY_BOARD_SERVICES && MONDAY_BOARD_LIVRAISONS ? "configured" : "not_configured",
     },
   });
 });
 
 /* ============================================================
-3) TWILIO – TOKEN + TWIML
+3) TWILIO – TOKEN + TWIML (Voice)
 ============================================================ */
 app.post("/api/twilio-token", (req, res) => {
   if (!TWILIO_ENABLED) {
@@ -267,6 +274,209 @@ app.post("/api/voice", (req, res) => {
 
   res.type("text/xml");
   res.send(response.toString());
+});
+
+/* ============================================================
+3.1) TWILIO – CONVERSATIONS (Chat/SMS)
+============================================================ */
+function getTwilioClient() {
+  // Use API Key auth (recommended for server-side)
+  // twilio(apiKeySid, apiKeySecret, { accountSid })
+  if (!TWILIO_CONVERSATIONS_ENABLED) return null;
+  return twilio(TWILIO_API_KEY, TWILIO_API_SECRET, { accountSid: TWILIO_ACCOUNT_SID });
+}
+
+function validateTwilioSignature(req) {
+  // If no auth token, we can't validate signature (accept but warn)
+  if (!TWILIO_AUTH_TOKEN) return { ok: true, skipped: true };
+
+  const signature = req.header("X-Twilio-Signature");
+  if (!signature) return { ok: false, reason: "MISSING_SIGNATURE" };
+
+  // Build the full URL Twilio requested (Render is HTTPS)
+  const url = `https://${req.get("host")}${req.originalUrl}`;
+  const ok = twilio.validateRequest(TWILIO_AUTH_TOKEN, signature, url, req.body);
+  return { ok };
+}
+
+// Webhook called by Twilio Conversations for events (onMessageAdded, onDeliveryUpdated, etc.)
+app.post("/twilio/conversations-webhook", async (req, res) => {
+  const v = validateTwilioSignature(req);
+  if (!v.ok) {
+    return res.status(403).send("Invalid Twilio signature");
+  }
+
+  // ACK fast
+  res.status(200).send("ok");
+
+  // Process async (log / DB / ticketing)
+  try {
+    const eventType = req.body?.EventType || "";
+    const conversationSid = req.body?.ConversationSid || "";
+    const messageSid = req.body?.MessageSid || "";
+    const author = req.body?.Author || "";
+    const body = req.body?.Body || "";
+    const participantSid = req.body?.ParticipantSid || "";
+    const source = req.body?.Source || ""; // e.g. "SMS"
+    const dateCreated = req.body?.DateCreated || null;
+
+    console.log("[TWILIO][CONV_WEBHOOK]", {
+      eventType,
+      conversationSid,
+      messageSid,
+      author,
+      participantSid,
+      source,
+      dateCreated,
+      bodyPreview: (body || "").slice(0, 160),
+      signatureValidation: v.skipped ? "skipped_no_auth_token" : "validated",
+    });
+
+    // TODO (next step): persist in DB + link to Monday ticket if needed
+    // For now we just log; your UI can poll Twilio via /api/conversations endpoints.
+  } catch (e) {
+    console.error("[TWILIO][CONV_WEBHOOK][ERROR]", e?.message || e);
+  }
+});
+
+// List conversations (for your OPS UI)
+app.get("/api/conversations", async (req, res) => {
+  const client = getTwilioClient();
+  if (!client) {
+    return res.status(503).json({
+      ok: false,
+      error: "TWILIO_CONVERSATIONS_DISABLED",
+      message: "Missing env vars (TWILIO_CONVERSATIONS_SERVICE_SID / API key / account sid).",
+    });
+  }
+
+  try {
+    const limit = Math.max(1, Math.min(200, Number(req.query.limit || 50)));
+
+    // Note: Twilio's list is account-wide; we can filter by serviceSid by fetching and filtering.
+    // Some SDK versions support "services(serviceSid).conversations" (preferred).
+    let conversations = [];
+    if (client.conversations?.v1?.services) {
+      const r = await client.conversations.v1
+        .services(TWILIO_CONVERSATIONS_SERVICE_SID)
+        .conversations.list({ limit });
+      conversations = r || [];
+    } else {
+      // Fallback (older SDK)
+      const r = await client.conversations.v1.conversations.list({ limit });
+      conversations = (r || []).filter((c) => c.chatServiceSid === TWILIO_CONVERSATIONS_SERVICE_SID);
+    }
+
+    const payload = conversations.map((c) => ({
+      sid: c.sid,
+      friendlyName: c.friendlyName || null,
+      state: c.state || null,
+      dateCreated: c.dateCreated || null,
+      dateUpdated: c.dateUpdated || null,
+      uniqueName: c.uniqueName || null,
+      chatServiceSid: c.chatServiceSid || null,
+    }));
+
+    res.json({ ok: true, count: payload.length, conversations: payload });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// List messages in a conversation
+app.get("/api/conversations/:sid/messages", async (req, res) => {
+  const client = getTwilioClient();
+  if (!client) return res.status(503).json({ ok: false, error: "TWILIO_CONVERSATIONS_DISABLED" });
+
+  const sid = String(req.params.sid || "").trim();
+  if (!sid) return res.status(400).json({ ok: false, error: "MISSING_CONVERSATION_SID" });
+
+  try {
+    const limit = Math.max(1, Math.min(200, Number(req.query.limit || 50)));
+
+    const msgs = await client.conversations.v1
+      .services(TWILIO_CONVERSATIONS_SERVICE_SID)
+      .conversations(sid)
+      .messages.list({ limit });
+
+    const payload = (msgs || []).map((m) => ({
+      sid: m.sid,
+      conversationSid: m.conversationSid,
+      author: m.author,
+      body: m.body,
+      dateCreated: m.dateCreated,
+      index: m.index,
+      participantSid: m.participantSid || null,
+    }));
+
+    res.json({ ok: true, count: payload.length, messages: payload.reverse() }); // oldest -> newest
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// Send a message to a conversation
+app.post("/api/conversations/:sid/messages", async (req, res) => {
+  const client = getTwilioClient();
+  if (!client) return res.status(503).json({ ok: false, error: "TWILIO_CONVERSATIONS_DISABLED" });
+
+  const sid = String(req.params.sid || "").trim();
+  if (!sid) return res.status(400).json({ ok: false, error: "MISSING_CONVERSATION_SID" });
+
+  const body = String(req.body?.body || "").trim();
+  const author = String(req.body?.author || "AFI_OPS").trim();
+
+  if (!body) return res.status(400).json({ ok: false, error: "MISSING_BODY" });
+
+  try {
+    const msg = await client.conversations.v1
+      .services(TWILIO_CONVERSATIONS_SERVICE_SID)
+      .conversations(sid)
+      .messages.create({ author, body });
+
+    res.json({ ok: true, messageSid: msg.sid });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// Optional helper: start a conversation with an SMS participant (server-side)
+app.post("/api/conversations/start", async (req, res) => {
+  const client = getTwilioClient();
+  if (!client) return res.status(503).json({ ok: false, error: "TWILIO_CONVERSATIONS_DISABLED" });
+
+  const phone = String(req.body?.phone || "").trim(); // +1...
+  if (!/^\+\d{10,15}$/.test(phone)) {
+    return res.status(400).json({ ok: false, error: "BAD_PHONE", message: "Use E.164 format +1..." });
+  }
+
+  const friendlyName = String(req.body?.friendlyName || `SMS ${phone}`).trim();
+  const uniqueName = String(req.body?.uniqueName || "").trim(); // optional stable key
+
+  try {
+    // Create conversation
+    const conv = await client.conversations.v1
+      .services(TWILIO_CONVERSATIONS_SERVICE_SID)
+      .conversations.create({
+        friendlyName,
+        ...(uniqueName ? { uniqueName } : {}),
+      });
+
+    // Add SMS participant
+    // messagingBinding.address = customer's phone
+    // messagingBinding.proxyAddress = your Twilio number
+    await client.conversations.v1
+      .services(TWILIO_CONVERSATIONS_SERVICE_SID)
+      .conversations(conv.sid)
+      .participants.create({
+        "messagingBinding.address": phone,
+        "messagingBinding.proxyAddress": TWILIO_PHONE_NUMBER,
+      });
+
+    res.json({ ok: true, conversationSid: conv.sid });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
 });
 
 /* ============================================================
@@ -452,7 +662,6 @@ app.get("/api/monday/tickets", async (req, res) => {
 
 /* ============================================================
 5.0) ✅ PATCH (non-breaking): /api/monday/tickets-normalized
-     Multi-board, exact fields for OPS Map
 ============================================================ */
 function mustEnv(name) {
   const v = process.env[name];
@@ -502,7 +711,6 @@ function normalizeTicketForOpsMap({ item, boardId, addressColId, dateColId }) {
 
 app.get("/api/monday/tickets-normalized", async (req, res) => {
   try {
-    // Validate env required for this endpoint only
     mustEnv("MONDAY_TOKEN");
     const boardServices = mustEnv("MONDAY_BOARD_SERVICES");
     const boardLivraisons = mustEnv("MONDAY_BOARD_LIVRAISONS");
@@ -1007,10 +1215,6 @@ app.get("/api/outlook/messages", async (req, res) => {
   }
 });
 
-// ============================================================
-// 7.1) OUTLOOK – FOLDERS + MESSAGE DETAIL
-// ============================================================
-
 // Helper Graph générique
 async function callGraph(token, url) {
   const r = await axios.get(url, {
@@ -1041,7 +1245,7 @@ app.get("/api/outlook/folders", async (req, res) => {
     graphUrl.searchParams.set(
       "$select",
       "id,displayName,parentFolderId,childFolderCount,unreadItemCount,totalItemCount"
-    );
+    understanding
 
     const data = await callGraph(token, graphUrl.toString());
     res.json({
@@ -1187,4 +1391,7 @@ app.listen(PORT, () => {
   console.log("   render.gitCommit:", BUILD.render.gitCommit);
   console.log("   render.instanceId:", BUILD.render.instanceId);
   console.log("   outlook.configured:", OUTLOOK_CONFIGURED);
+  console.log("   twilio.voice.enabled:", TWILIO_ENABLED);
+  console.log("   twilio.conversations.enabled:", TWILIO_CONVERSATIONS_ENABLED);
+  if (!TWILIO_AUTH_TOKEN) console.log("   ⚠️ TWILIO_AUTH_TOKEN missing (webhook signature validation skipped)");
 });
