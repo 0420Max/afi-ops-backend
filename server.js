@@ -885,6 +885,41 @@ app.post("/api/monday/resolve-ticket", async (req, res) => {
 /* ============================================================
 6.1) ✅ PATCH compat – /api/tickets/:id
 ============================================================ */
+
+// --- Monday: who am I (token owner) ---
+app.get("/api/monday/me", async (req, res) => {
+  try {
+    const q = `query { me { id name email } }`;
+    const r = await mondayRequest(q, {});
+    res.json({ ok: true, me: r?.data?.me || null });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// --- Monday: add internal update/note to an item ---
+app.post("/api/monday/add-update", async (req, res) => {
+  try {
+    const itemId = String(req.body.itemId || req.body.id || "").trim();
+    const body = String(req.body.body || "").trim();
+
+    if (!itemId || !body) {
+      return res.status(400).json({ ok: false, error: "itemId and body are required" });
+    }
+
+    const m = `
+      mutation ($itemId: ID!, $body: String!) {
+        create_update(item_id: $itemId, body: $body) { id }
+      }
+    `;
+    const r = await mondayRequest(m, { itemId, body });
+    res.json({ ok: true, updateId: r?.data?.create_update?.id || null });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+
 app.patch("/api/tickets/:id", async (req, res) => {
   const itemId = String(req.params.id || "");
   if (!itemId) return res.status(400).json({ ok: false, error: "MISSING_ID" });
