@@ -25,6 +25,9 @@ require("dotenv").config();
 
 const app = express();
 
+// ✅ Render/proxy safety (Twilio URLs, protocol/host correctness behind proxy)
+app.set("trust proxy", 1);
+
 /* ============================================================
 0) CORS FIX – ULTRA ROBUSTE (with optional ALLOWED_ORIGINS merge)
 ============================================================ */
@@ -542,20 +545,27 @@ function normalizeTicketFromMondayItem(item) {
     const s = statusText.toLowerCase();
     if (s.includes("urgent")) return "urgent";
     if (s.includes("attente") || s.includes("wait") || s.includes("pending")) return "wait";
-    if (s.includes("résolu") || s.includes("resolu") || s.includes("done") || s.includes("closed")) return "closed";
+    if (s.includes("résolu") || s.includes("resolu") || s.includes("done") || s.includes("closed"))
+      return "closed";
     return "open";
   })();
 
-  const serviceType = pick(cols, ["type service", "service", "type", "catégorie", "categorie"]) || (item?.group?.title || "SAV");
-  const customerName = pick(cols, ["client", "nom", "customer", "customer name"]) || item?.name || "Client";
+  const serviceType =
+    pick(cols, ["type service", "service", "type", "catégorie", "categorie"]) ||
+    (item?.group?.title || "SAV");
+  const customerName =
+    pick(cols, ["client", "nom", "customer", "customer name"]) || item?.name || "Client";
   const product = pick(cols, ["produit", "product", "modèle", "modele", "équipement", "equipement"]);
-  const summary = pick(cols, ["problème", "probleme", "description", "résumé", "resume", "détails", "details"]) || item?.name || "";
+  const summary =
+    pick(cols, ["problème", "probleme", "description", "résumé", "resume", "détails", "details"]) ||
+    item?.name ||
+    "";
   const phone = pick(cols, ["téléphone", "telephone", "phone"]);
   const email = pick(cols, ["courriel", "email", "e-mail"]);
   const location = pick(cols, ["adresse", "address", "ville", "city", "localisation", "location"]);
 
   const tagsRaw = pick(cols, ["tags", "labels", "étiquettes", "etiquettes"]);
-  const tags = tagsRaw ? tagsRaw.split(/[,\|]/).map(x => x.trim()).filter(Boolean) : [];
+  const tags = tagsRaw ? tagsRaw.split(/[,\|]/).map((x) => x.trim()).filter(Boolean) : [];
 
   return {
     id: String(item?.id || ""),
@@ -573,7 +583,7 @@ function normalizeTicketFromMondayItem(item) {
       boardId: DEFAULT_BOARD_ID,
       group: item?.group || null,
       updatedAt: item?.updated_at || null,
-    }
+    },
   };
 }
 
@@ -621,9 +631,7 @@ async function fetchMondayItems({ boardId, groupId, limit }) {
       }
     `;
 
-  const variables = useGroup
-    ? { boardId, groupId, limit }
-    : { boardId, limit };
+  const variables = useGroup ? { boardId, groupId, limit } : { boardId, limit };
 
   const r = await mondayRequest(query, variables);
 
@@ -886,18 +894,18 @@ app.post("/api/monday/resolve-ticket", async (req, res) => {
 6.1) ✅ PATCH compat – /api/tickets/:id
 ============================================================ */
 
-// --- Monday: who am I (token owner) ---
+// --- Monday: who am I (token owner) --- ✅ FIXED: correct axios response shape
 app.get("/api/monday/me", async (req, res) => {
   try {
     const q = `query { me { id name email } }`;
     const r = await mondayRequest(q, {});
-    res.json({ ok: true, me: r?.data?.me || null });
+    res.json({ ok: true, me: r?.data?.data?.me || null });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-// --- Monday: add internal update/note to an item ---
+// --- Monday: add internal update/note to an item --- ✅ FIXED: correct axios response shape
 app.post("/api/monday/add-update", async (req, res) => {
   try {
     const itemId = String(req.body.itemId || req.body.id || "").trim();
@@ -913,12 +921,11 @@ app.post("/api/monday/add-update", async (req, res) => {
       }
     `;
     const r = await mondayRequest(m, { itemId, body });
-    res.json({ ok: true, updateId: r?.data?.create_update?.id || null });
+    res.json({ ok: true, updateId: r?.data?.data?.create_update?.id || null });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
-
 
 app.patch("/api/tickets/:id", async (req, res) => {
   const itemId = String(req.params.id || "");
@@ -1134,7 +1141,13 @@ app.get("/api/outlook/callback", async (req, res) => {
     outlookStore.last_error = { error: err, error_description: errDesc || null };
     outlookStore.connected = false;
     saveOutlookTokens();
-    return res.status(400).send(`<html><body><pre>Outlook OAuth error: ${escapeHtml(err)}\n${escapeHtml(errDesc || "")}</pre></body></html>`);
+    return res
+      .status(400)
+      .send(
+        `<html><body><pre>Outlook OAuth error: ${escapeHtml(err)}\n${escapeHtml(
+          errDesc || ""
+        )}</pre></body></html>`
+      );
   }
 
   if (!code) {
@@ -1192,7 +1205,13 @@ app.get("/api/outlook/callback", async (req, res) => {
     outlookStore.expires_at = 0;
     saveOutlookTokens();
 
-    res.status(500).send(`<html><body><pre>Token exchange failed:\n${escapeHtml(JSON.stringify(outlookStore.last_error, null, 2))}</pre></body></html>`);
+    res
+      .status(500)
+      .send(
+        `<html><body><pre>Token exchange failed:\n${escapeHtml(
+          JSON.stringify(outlookStore.last_error, null, 2)
+        )}</pre></body></html>`
+      );
   }
 });
 
@@ -1217,9 +1236,10 @@ app.get("/api/outlook/messages", async (req, res) => {
     const top = Math.max(5, Math.min(50, Number(req.query.top || 25)));
     const folderId = req.query.folderId || "Inbox";
 
-    const basePath = folderId === "Inbox"
-      ? "me/mailFolders/Inbox/messages"
-      : `me/mailFolders/${encodeURIComponent(folderId)}/messages`;
+    const basePath =
+      folderId === "Inbox"
+        ? "me/mailFolders/Inbox/messages"
+        : `me/mailFolders/${encodeURIComponent(folderId)}/messages`;
 
     const graphUrl = new URL(`https://graph.microsoft.com/v1.0/${basePath}`);
     graphUrl.searchParams.set("$top", String(top));
@@ -1278,9 +1298,9 @@ app.get("/api/outlook/folders", async (req, res) => {
     const graphUrl = new URL("https://graph.microsoft.com/v1.0/me/mailFolders");
     graphUrl.searchParams.set("$top", "50");
     graphUrl.searchParams.set(
-  "$select",
-  "id,displayName,parentFolderId,childFolderCount,unreadItemCount,totalItemCount"
-);
+      "$select",
+      "id,displayName,parentFolderId,childFolderCount,unreadItemCount,totalItemCount"
+    );
 
     const data = await callGraph(token, graphUrl.toString());
     res.json({
@@ -1315,7 +1335,9 @@ app.get("/api/outlook/message/:id", async (req, res) => {
   }
 
   try {
-    const graphUrl = new URL(`https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(msgId)}`);
+    const graphUrl = new URL(
+      `https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(msgId)}`
+    );
     graphUrl.searchParams.set(
       "$select",
       "id,subject,from,toRecipients,ccRecipients,replyTo,receivedDateTime,hasAttachments,importance,isRead,body"
@@ -1428,5 +1450,6 @@ app.listen(PORT, () => {
   console.log("   outlook.configured:", OUTLOOK_CONFIGURED);
   console.log("   twilio.voice.enabled:", TWILIO_ENABLED);
   console.log("   twilio.conversations.enabled:", TWILIO_CONVERSATIONS_ENABLED);
-  if (!TWILIO_AUTH_TOKEN) console.log("   ⚠️ TWILIO_AUTH_TOKEN missing (webhook signature validation skipped)");
+  if (!TWILIO_AUTH_TOKEN)
+    console.log("   ⚠️ TWILIO_AUTH_TOKEN missing (webhook signature validation skipped)");
 });
