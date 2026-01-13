@@ -1,3 +1,4 @@
+
 /**
  * ============================================================
  * AFI OPS – Backend Central (Render / Local)
@@ -24,9 +25,6 @@ const fs = require("fs");
 require("dotenv").config();
 
 const app = express();
-
-// ✅ Render/proxy safety (Twilio URLs, protocol/host correctness behind proxy)
-app.set("trust proxy", 1);
 
 /* ============================================================
 0) CORS FIX – ULTRA ROBUSTE (with optional ALLOWED_ORIGINS merge)
@@ -122,6 +120,13 @@ const {
   /* GPT */
   OPENAI_API_KEY,
   OPENAI_MODEL,
+
+  /* Vapi */
+  VAPI_ASSISTANT_ID,
+  VAPI_FORWARD_NUMBER,
+  VAPI_DEFAULT_MODE,
+  VAPI_WEBHOOK_SECRET,
+
 } = process.env;
 
 const DEFAULT_BOARD_ID = Number(MONDAY_BOARD_ID || 1763228524);
@@ -129,6 +134,99 @@ const DEFAULT_GROUP_ID = String(MONDAY_GROUP_ID || "topics");
 const MONDAY_LIMIT = Number(MONDAY_ITEMS_LIMIT || 50);
 const MONDAY_TTL = Number(MONDAY_TTL_MS || 25000);
 const MONDAY_VERSION = MONDAY_API_VERSION || "2023-10";
+
+/* ============================================================
+2.5) VAPI – Webhook (assistant-request, tool-calls, end-of-call-report)
+============================================================ */
+const VAPI_MODE_FILE = process.env.VAPI_MODE_FILE || "./.vapi-mode.json";
+let vapiMode = (VAPI_DEFAULT_MODE || "ai").toLowerCase() === "off" ? "off" : "ai";
+try {
+  if (fs.existsSync(VAPI_MODE_FILE)) {
+    const raw = JSON.parse(fs.readFileSync(VAPI_MODE_FILE, "utf8"));
+    if (raw?.mode === "off" || raw?.mode === "ai") vapiMode = raw.mode;
+  }
+} catch {}
+
+const vapiCalls = []; // newest first
+const vapiCallToTicket = new Map(); // callId -> ticketId
+
+function persistVapiMode() {
+  try { fs.writeFileSync(VAPI_MODE_FILE, JSON.stringify({ mode: vapiMode, updatedAt: new Date().toISOString() }, null, 2)); } catch {}
+}
+
+function vapiAuthOk(req) {
+  if (!VAPI_WEBHOOK_SECRET) return true;
+  const secret = String(VAPI_WEBHOOK_SECRET);
+  const x = String(req.headers["x-vapi-secret"] || "");
+  if (x && x === secret) return true;
+
+  const auth = String(req.headers["authorization"] || "");
+  if (auth) {
+    const m = auth.match(/^Bearer\s+(.+)$/i);
+    const token = (m ? m[1] : auth).trim();
+    if (token === secret) return true;
+  }
+  return false;
+}
+
+function pushVapiCall(update) {
+  const id = String(update?.id || "");
+  if (!id) return;
+  const idx = vapiCalls.findIndex((c) => c.id === id);
+  if (idx >= 0) vapiCalls[idx] = { ...vapiCalls[idx], ...update };
+  else vapiCalls.unshift(update);
+  if (vapiCalls.length > 50) vapiCalls.length = 50;
+}
+
+function buildTransientVapiAssistant() {
+  // Minimal assistant if you don't want to maintain a saved assistant in the dashboard.
+  const sys = `
+Tu es l’agent vocal SAV AFI.
+
+Objectif:
+1) Diagnostiquer et tenter 1 à 2 actions d’assistance rapides.
+2) Dans TOUS les cas, créer un ticket de demande d’assistance.
+
+Règles:
+- Avant de terminer l’appel, tu DOIS obtenir: nom complet, courriel, téléphone, adresse de service.
+- Résume le problème, les vérifications faites, et les infos techniques (type de bassin, modèle, numéro de série, etc.).
+- Ensuite appelle l’outil create_support_ticket avec tous les champs.
+- Si une info manque, insiste poliment et guide l’utilisateur pour la trouver.
+`.trim();
+
+  return {
+    firstMessage: "Bonjour, ici le support AFI. Comment puis-je vous aider aujourd'hui ?",
+    serverMessages: ["tool-calls", "end-of-call-report", "status-update", "transcript"],
+    model: {
+      provider: "openai",
+      model: "gpt-4o",
+      messages: [{ role: "system", content: sys }],
+      functions: [
+        {
+          name: "create_support_ticket",
+          description: "Crée un ticket SAV dans Monday et retourne l'id du ticket.",
+          parameters: {
+            type: "object",
+            properties: {
+              clientName: { type: "string" },
+              email: { type: "string" },
+              phone: { type: "string" },
+              serviceAddress: { type: "string" },
+              reason: { type: "string" },
+              details: { type: "string" },
+              poolType: { type: "string" },
+              modelNumber: { type: "string" },
+              serialNumber: { type: "string" },
+              attemptedFixes: { type: "string" }
+            },
+            required: ["clientName", "email", "phone", "serviceAddress", "reason"]
+          }
+        }
+      ]
+    }
+  };
+}
+
 
 const STATUS_COL = MONDAY_STATUS_COLUMN_ID || "status";
 const ASSIGNEE_COL = MONDAY_ASSIGNEE_COLUMN_ID || "person";
@@ -202,6 +300,7 @@ app.get("/api/health", (req, res) => {
     services: {
       twilio: TWILIO_ENABLED ? "ready" : "disabled",
       twilioConversations: TWILIO_CONVERSATIONS_ENABLED ? "ready" : "missing_env",
+      vapi: VAPI_ASSISTANT_ID ? "ready" : "transient_ready",
       monday: MONDAY_TOKEN ? "ready" : "missing_token",
       outlook: OUTLOOK_CONFIGURED ? "configured" : "not_configured",
       tidio: TIDIO_PROJECT_ID ? "ready" : "not_configured",
@@ -214,6 +313,194 @@ app.get("/api/health", (req, res) => {
     },
   });
 });
+
+/* ============================================================
+2.6) VAPI – Console controls + Webhook
+============================================================ */
+app.get("/api/vapi/status", (req, res) => {
+  const last = vapiCalls[0] || null;
+  res.json({
+    ok: true,
+    mode: vapiMode,
+    assistantIdConfigured: Boolean(VAPI_ASSISTANT_ID),
+    lastCall: last ? {
+      id: last.id,
+      from: last.from,
+      to: last.to,
+      startedAt: last.startedAt,
+      endedAt: last.endedAt,
+      endedReason: last.endedReason,
+      ticketId: last.ticketId || vapiCallToTicket.get(last.id) || null
+    } : null
+  });
+});
+
+app.post("/api/vapi/mode", (req, res) => {
+  const mode = String(req.body?.mode || "").toLowerCase();
+  vapiMode = mode === "off" ? "off" : "ai";
+  persistVapiMode();
+  res.json({ ok: true, mode: vapiMode });
+});
+
+app.get("/api/vapi/calls", (req, res) => {
+  res.json({ ok: true, calls: vapiCalls.slice(0, 25) });
+});
+
+app.post("/api/vapi/simulate", (req, res) => {
+  // Dev helper: inject a fake end-of-call report for UI testing
+  const id = "call_sim_" + Date.now();
+  pushVapiCall({
+    id,
+    from: "+1 514-555-0101",
+    to: "AFI",
+    startedAt: new Date(Date.now() - 120000).toISOString(),
+    endedAt: new Date().toISOString(),
+    endedReason: "simulated",
+    transcript: "Client: Ma pompe ne démarre plus. Agent: Avez-vous vérifié le disjoncteur et l'horloge? Client: Oui. Agent: Merci, je crée un ticket.",
+    ticketId: null
+  });
+  res.json({ ok: true, id });
+});
+
+app.post("/api/vapi/webhook", async (req, res) => {
+  if (!vapiAuthOk(req)) return res.status(401).json({ ok: false, error: "VAPI_UNAUTHORIZED" });
+
+  const message = req.body?.message || {};
+  const type = String(message?.type || "");
+
+  try {
+    // 1) assistant-request: choose assistant or transfer destination
+    if (type === "assistant-request") {
+      if (vapiMode === "off" && VAPI_FORWARD_NUMBER) {
+        return res.json({
+          destination: {
+            type: "number",
+            number: VAPI_FORWARD_NUMBER,
+            message: "Transfert vers un agent."
+          }
+        });
+      }
+
+      if (VAPI_ASSISTANT_ID) return res.json({ assistantId: VAPI_ASSISTANT_ID });
+      return res.json({ assistant: buildTransientVapiAssistant() });
+    }
+
+    // 2) tool-calls: execute custom tools
+    if (type === "tool-calls") {
+      const toolCalls = message.toolCallList || [];
+      const results = [];
+
+      for (const tc of toolCalls) {
+        const name = String(tc?.name || "");
+        const toolCallId = String(tc?.id || "");
+        const p = tc?.parameters || {};
+        let result = null;
+
+        if (name === "create_support_ticket" || name === "createSupportTicket") {
+          // Build ticket payload for Monday
+          const payload = {
+            clientName: p.clientName || p.name || p.fullName || "Inconnu",
+            email: p.email || p.emailAddress || "",
+            phone: p.phone || p.phoneNumber || "",
+            serviceAddress: p.serviceAddress || p.address || "",
+            reason: p.reason || p.problem || p.issue || "Appel SAV",
+            details: p.details || "",
+            poolType: p.poolType || "",
+            modelNumber: p.modelNumber || "",
+            serialNumber: p.serialNumber || "",
+            attemptedFixes: p.attemptedFixes || ""
+          };
+
+          // Create item using existing endpoint helper: createTicketOnMonday()
+          const created = await createSupportTicketFromVoice(payload, message);
+          result = created;
+          if (created?.itemId && message?.call?.id) {
+            vapiCallToTicket.set(String(message.call.id), String(created.itemId));
+            pushVapiCall({ id: String(message.call.id), ticketId: String(created.itemId) });
+          }
+        } else {
+          result = { ok: false, error: "UNKNOWN_TOOL", name };
+        }
+
+        results.push({ name, toolCallId, result: JSON.stringify(result) });
+      }
+
+      return res.json({ results });
+    }
+
+    // 3) end-of-call-report: store transcript + create fallback ticket if missing
+    if (type === "end-of-call-report") {
+      const call = message.call || {};
+      const artifact = message.artifact || {};
+      const id = String(call.id || "");
+      const from = call?.customer?.number || call?.phoneNumber?.number || call?.from || "";
+      const to = call?.phoneNumber?.number || call?.to || "";
+      const transcript = artifact.transcript || "";
+      const endedAt = call?.endedAt || new Date().toISOString();
+
+      pushVapiCall({
+        id,
+        from,
+        to,
+        startedAt: call?.startedAt || null,
+        endedAt,
+        endedReason: message?.endedReason || null,
+        transcript: transcript ? String(transcript).slice(0, 12000) : null,
+        ticketId: vapiCallToTicket.get(id) || null
+      });
+
+      // Fallback ticket creation if none yet
+      if (id && MONDAY_TOKEN && !vapiCallToTicket.get(id)) {
+        const fallback = {
+          clientName: "Inconnu",
+          email: "",
+          phone: from,
+          serviceAddress: "",
+          reason: "Appel entrant (VAPI)",
+          details: transcript ? `Transcript:\n${transcript}` : "Appel sans transcript.",
+          attemptedFixes: ""
+        };
+        const created = await createSupportTicketFromVoice(fallback, message);
+        if (created?.itemId) {
+          vapiCallToTicket.set(id, String(created.itemId));
+          pushVapiCall({ id, ticketId: String(created.itemId) });
+        }
+      }
+
+      return res.json({ ok: true });
+    }
+
+    // Other events: store useful ones (status-update, transcript)
+    if (type === "status-update") {
+      const call = message.call || {};
+      const id = String(call.id || "");
+      pushVapiCall({
+        id,
+        from: call?.customer?.number || "",
+        to: call?.phoneNumber?.number || "",
+        startedAt: call?.startedAt || null,
+        status: message.status || null
+      });
+      return res.json({ ok: true });
+    }
+
+    if (type === "transcript") {
+      // optional: keep last partial transcript snippets
+      const call = message.call || {};
+      const id = String(call.id || "");
+      if (id) {
+        pushVapiCall({ id, lastUtterance: message.transcript || "" });
+      }
+      return res.json({ ok: true });
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("[VAPI WEBHOOK ERROR]", e);
+    return res.status(500).json({ ok: false, error: "VAPI_WEBHOOK_ERROR", details: String(e?.message || e) });
+  }
+});
+
 
 /* ============================================================
 3) TWILIO – TOKEN + TWIML (Voice)
@@ -545,27 +832,20 @@ function normalizeTicketFromMondayItem(item) {
     const s = statusText.toLowerCase();
     if (s.includes("urgent")) return "urgent";
     if (s.includes("attente") || s.includes("wait") || s.includes("pending")) return "wait";
-    if (s.includes("résolu") || s.includes("resolu") || s.includes("done") || s.includes("closed"))
-      return "closed";
+    if (s.includes("résolu") || s.includes("resolu") || s.includes("done") || s.includes("closed")) return "closed";
     return "open";
   })();
 
-  const serviceType =
-    pick(cols, ["type service", "service", "type", "catégorie", "categorie"]) ||
-    (item?.group?.title || "SAV");
-  const customerName =
-    pick(cols, ["client", "nom", "customer", "customer name"]) || item?.name || "Client";
+  const serviceType = pick(cols, ["type service", "service", "type", "catégorie", "categorie"]) || (item?.group?.title || "SAV");
+  const customerName = pick(cols, ["client", "nom", "customer", "customer name"]) || item?.name || "Client";
   const product = pick(cols, ["produit", "product", "modèle", "modele", "équipement", "equipement"]);
-  const summary =
-    pick(cols, ["problème", "probleme", "description", "résumé", "resume", "détails", "details"]) ||
-    item?.name ||
-    "";
+  const summary = pick(cols, ["problème", "probleme", "description", "résumé", "resume", "détails", "details"]) || item?.name || "";
   const phone = pick(cols, ["téléphone", "telephone", "phone"]);
   const email = pick(cols, ["courriel", "email", "e-mail"]);
   const location = pick(cols, ["adresse", "address", "ville", "city", "localisation", "location"]);
 
   const tagsRaw = pick(cols, ["tags", "labels", "étiquettes", "etiquettes"]);
-  const tags = tagsRaw ? tagsRaw.split(/[,\|]/).map((x) => x.trim()).filter(Boolean) : [];
+  const tags = tagsRaw ? tagsRaw.split(/[,\|]/).map(x => x.trim()).filter(Boolean) : [];
 
   return {
     id: String(item?.id || ""),
@@ -583,13 +863,98 @@ function normalizeTicketFromMondayItem(item) {
       boardId: DEFAULT_BOARD_ID,
       group: item?.group || null,
       updatedAt: item?.updated_at || null,
-    },
+    }
   };
 }
 
 /* ============================================================
 5) MONDAY – FETCH TICKETS (raw)
 ============================================================ */
+
+
+async function createSupportTicketFromVoice(payload, vapiMessage) {
+  if (!MONDAY_TOKEN) return { ok: false, error: "MONDAY_TOKEN_MISSING" };
+
+  const callId = String(vapiMessage?.call?.id || "");
+  const reason = String(payload?.reason || "Appel SAV").trim();
+  const name = String(payload?.clientName || "Inconnu").trim();
+  const itemName = `SAV • ${name} • ${reason}`.slice(0, 160);
+
+  // Column IDs (override via ENV if your board differs)
+  const COL = {
+    email: process.env.MONDAY_COL_EMAIL || "email_mkctw7qd",
+    phone: process.env.MONDAY_COL_PHONE || "phone_mkcrrn8p",
+    address: process.env.MONDAY_COL_ADDRESS || "text_mkc4er9w",
+    description: process.env.MONDAY_COL_DESC || "long_text_mkctw6z7",
+    status: process.env.MONDAY_STATUS_COLUMN_ID || "status",
+    source: process.env.MONDAY_COL_SOURCE || null,
+    callId: process.env.MONDAY_COL_CALL_ID || null,
+    model: process.env.MONDAY_COL_MODEL || null,
+    serial: process.env.MONDAY_COL_SERIAL || null,
+    poolType: process.env.MONDAY_COL_POOLTYPE || null
+  };
+
+  const columnValues = {};
+  if (COL.email) columnValues[COL.email] = payload.email ? { email: payload.email, text: payload.email } : null;
+  if (COL.phone) columnValues[COL.phone] = payload.phone ? { phone: payload.phone, countryShortName: "CA" } : null;
+  if (COL.address) columnValues[COL.address] = payload.serviceAddress || "";
+  if (COL.description) {
+    const parts = [
+      `Raison: ${payload.reason || ""}`,
+      payload.details ? `Détails:\n${payload.details}` : "",
+      payload.attemptedFixes ? `Tentatives:\n${payload.attemptedFixes}` : "",
+      payload.poolType ? `Type bassin: ${payload.poolType}` : "",
+      payload.modelNumber ? `Modèle: ${payload.modelNumber}` : "",
+      payload.serialNumber ? `Série: ${payload.serialNumber}` : "",
+      callId ? `VAPI callId: ${callId}` : ""
+    ].filter(Boolean);
+    columnValues[COL.description] = { text: parts.join("\n\n").slice(0, 8000) };
+  }
+  if (COL.model) columnValues[COL.model] = payload.modelNumber || "";
+  if (COL.serial) columnValues[COL.serial] = payload.serialNumber || "";
+  if (COL.poolType) columnValues[COL.poolType] = payload.poolType || "";
+  if (COL.callId && callId) columnValues[COL.callId] = callId;
+  if (COL.source) columnValues[COL.source] = "VAPI";
+
+  // Clean nulls
+  Object.keys(columnValues).forEach((k) => {
+    if (columnValues[k] === null) delete columnValues[k];
+  });
+
+  const query = `
+    mutation ($boardId: ID!, $groupId: String!, $itemName: String!, $columnValues: JSON!) {
+      create_item(board_id: $boardId, group_id: $groupId, item_name: $itemName, column_values: $columnValues) {
+        id
+        name
+      }
+    }
+  `;
+
+  const variables = {
+    boardId: Number(DEFAULT_BOARD_ID),
+    groupId: DEFAULT_GROUP_ID,
+    itemName,
+    columnValues: JSON.stringify(columnValues),
+  };
+
+  const r = await axios.post(
+    "https://api.monday.com/v2",
+    { query, variables },
+    {
+      timeout: MONDAY_TTL,
+      headers: {
+        Authorization: MONDAY_TOKEN,
+        "Content-Type": "application/json",
+        "API-Version": MONDAY_VERSION,
+      },
+    }
+  );
+
+  const item = r.data?.data?.create_item;
+  if (!item?.id) return { ok: false, error: "MONDAY_CREATE_FAILED", details: r.data };
+
+  return { ok: true, itemId: String(item.id), itemName: item.name };
+}
 async function fetchMondayItems({ boardId, groupId, limit }) {
   const useGroup = !!groupId;
 
@@ -631,7 +996,9 @@ async function fetchMondayItems({ boardId, groupId, limit }) {
       }
     `;
 
-  const variables = useGroup ? { boardId, groupId, limit } : { boardId, limit };
+  const variables = useGroup
+    ? { boardId, groupId, limit }
+    : { boardId, limit };
 
   const r = await mondayRequest(query, variables);
 
@@ -894,18 +1261,18 @@ app.post("/api/monday/resolve-ticket", async (req, res) => {
 6.1) ✅ PATCH compat – /api/tickets/:id
 ============================================================ */
 
-// --- Monday: who am I (token owner) --- ✅ FIXED: correct axios response shape
+// --- Monday: who am I (token owner) ---
 app.get("/api/monday/me", async (req, res) => {
   try {
     const q = `query { me { id name email } }`;
     const r = await mondayRequest(q, {});
-    res.json({ ok: true, me: r?.data?.data?.me || null });
+    res.json({ ok: true, me: r?.data?.me || null });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-// --- Monday: add internal update/note to an item --- ✅ FIXED: correct axios response shape
+// --- Monday: add internal update/note to an item ---
 app.post("/api/monday/add-update", async (req, res) => {
   try {
     const itemId = String(req.body.itemId || req.body.id || "").trim();
@@ -921,11 +1288,12 @@ app.post("/api/monday/add-update", async (req, res) => {
       }
     `;
     const r = await mondayRequest(m, { itemId, body });
-    res.json({ ok: true, updateId: r?.data?.data?.create_update?.id || null });
+    res.json({ ok: true, updateId: r?.data?.create_update?.id || null });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
+
 
 app.patch("/api/tickets/:id", async (req, res) => {
   const itemId = String(req.params.id || "");
@@ -1141,13 +1509,7 @@ app.get("/api/outlook/callback", async (req, res) => {
     outlookStore.last_error = { error: err, error_description: errDesc || null };
     outlookStore.connected = false;
     saveOutlookTokens();
-    return res
-      .status(400)
-      .send(
-        `<html><body><pre>Outlook OAuth error: ${escapeHtml(err)}\n${escapeHtml(
-          errDesc || ""
-        )}</pre></body></html>`
-      );
+    return res.status(400).send(`<html><body><pre>Outlook OAuth error: ${escapeHtml(err)}\n${escapeHtml(errDesc || "")}</pre></body></html>`);
   }
 
   if (!code) {
@@ -1205,13 +1567,7 @@ app.get("/api/outlook/callback", async (req, res) => {
     outlookStore.expires_at = 0;
     saveOutlookTokens();
 
-    res
-      .status(500)
-      .send(
-        `<html><body><pre>Token exchange failed:\n${escapeHtml(
-          JSON.stringify(outlookStore.last_error, null, 2)
-        )}</pre></body></html>`
-      );
+    res.status(500).send(`<html><body><pre>Token exchange failed:\n${escapeHtml(JSON.stringify(outlookStore.last_error, null, 2))}</pre></body></html>`);
   }
 });
 
@@ -1236,10 +1592,9 @@ app.get("/api/outlook/messages", async (req, res) => {
     const top = Math.max(5, Math.min(50, Number(req.query.top || 25)));
     const folderId = req.query.folderId || "Inbox";
 
-    const basePath =
-      folderId === "Inbox"
-        ? "me/mailFolders/Inbox/messages"
-        : `me/mailFolders/${encodeURIComponent(folderId)}/messages`;
+    const basePath = folderId === "Inbox"
+      ? "me/mailFolders/Inbox/messages"
+      : `me/mailFolders/${encodeURIComponent(folderId)}/messages`;
 
     const graphUrl = new URL(`https://graph.microsoft.com/v1.0/${basePath}`);
     graphUrl.searchParams.set("$top", String(top));
@@ -1298,9 +1653,9 @@ app.get("/api/outlook/folders", async (req, res) => {
     const graphUrl = new URL("https://graph.microsoft.com/v1.0/me/mailFolders");
     graphUrl.searchParams.set("$top", "50");
     graphUrl.searchParams.set(
-      "$select",
-      "id,displayName,parentFolderId,childFolderCount,unreadItemCount,totalItemCount"
-    );
+  "$select",
+  "id,displayName,parentFolderId,childFolderCount,unreadItemCount,totalItemCount"
+);
 
     const data = await callGraph(token, graphUrl.toString());
     res.json({
@@ -1335,9 +1690,7 @@ app.get("/api/outlook/message/:id", async (req, res) => {
   }
 
   try {
-    const graphUrl = new URL(
-      `https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(msgId)}`
-    );
+    const graphUrl = new URL(`https://graph.microsoft.com/v1.0/me/messages/${encodeURIComponent(msgId)}`);
     graphUrl.searchParams.set(
       "$select",
       "id,subject,from,toRecipients,ccRecipients,replyTo,receivedDateTime,hasAttachments,importance,isRead,body"
@@ -1450,6 +1803,5 @@ app.listen(PORT, () => {
   console.log("   outlook.configured:", OUTLOOK_CONFIGURED);
   console.log("   twilio.voice.enabled:", TWILIO_ENABLED);
   console.log("   twilio.conversations.enabled:", TWILIO_CONVERSATIONS_ENABLED);
-  if (!TWILIO_AUTH_TOKEN)
-    console.log("   ⚠️ TWILIO_AUTH_TOKEN missing (webhook signature validation skipped)");
+  if (!TWILIO_AUTH_TOKEN) console.log("   ⚠️ TWILIO_AUTH_TOKEN missing (webhook signature validation skipped)");
 });
