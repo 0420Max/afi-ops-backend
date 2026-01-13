@@ -1035,6 +1035,101 @@ app.get("/api/monday/tickets", async (req, res) => {
   }
 });
 
+
+/**
+ * /api/monday/map-items
+ * Retourne une liste d'items simplifiée pour la carte (pins).
+ * ✅ Pas de token Monday côté frontend: proxy backend.
+ *
+ * Query params (optionnels):
+ * - boardId: ID du board Monday (défaut: MONDAY_MAP_BOARD_ID ou DEFAULT_BOARD_ID)
+ * - limit: 1..500 (défaut 200)
+ * - locationColId: ID colonne adresse/localisation
+ * - typeColId: ID colonne type (souvent "status")
+ * - categoryColId: ID colonne catégorie (dropdown)
+ */
+app.get("/api/monday/map-items", async (req, res) => {
+  try {
+    mustEnv("MONDAY_TOKEN");
+
+    const boardId = Number(req.query.boardId || process.env.MONDAY_MAP_BOARD_ID || DEFAULT_BOARD_ID);
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit || "200", 10)));
+
+    const locationColId = String(
+      req.query.locationColId ||
+      process.env.MONDAY_MAP_COL_LOCATION ||
+      process.env.MONDAY_COL_ADDRESS ||
+      "text_mkx528gx"
+    );
+
+    const typeColId = String(
+      req.query.typeColId ||
+      process.env.MONDAY_MAP_COL_TYPE ||
+      "status"
+    );
+
+    const categoryColId = String(
+      req.query.categoryColId ||
+      process.env.MONDAY_MAP_COL_CATEGORY ||
+      "dropdown_mkx5qrs1"
+    );
+
+    const base = String(process.env.MONDAY_ACCOUNT_BASE || "https://aqua-fibre-innovation.monday.com").replace(/\/$/, "");
+
+    const query = `
+      query ($boardId: ID!, $limit: Int!) {
+        boards(ids: [$boardId]) {
+          id
+          name
+          items_page(limit: $limit) {
+            items {
+              id
+              name
+              column_values { id text value }
+            }
+          }
+        }
+      }
+    `;
+
+    const r = await mondayRequest(query, { boardId, limit });
+
+    if (r.data?.errors?.length) {
+      return res.status(500).json({ ok: false, errors: r.data.errors });
+    }
+
+    const rawItems = r.data?.data?.boards?.[0]?.items_page?.items || [];
+
+    const getCol = (cols, id) => {
+      const c = (cols || []).find((x) => x?.id === id);
+      return (c?.text || c?.value || "").toString().trim();
+    };
+
+    const items = rawItems.map((it) => {
+      const cols = it?.column_values || [];
+      return {
+        id: String(it?.id || ""),
+        title: it?.name || "",
+        location: getCol(cols, locationColId),
+        type: getCol(cols, typeColId),
+        category: getCol(cols, categoryColId),
+        url: `${base}/boards/${boardId}/pulses/${it?.id || ""}`
+      };
+    });
+
+    res.json({ ok: true, boardId: String(boardId), count: items.length, items });
+  } catch (e) {
+    if (e.code === "MONDAY_TOKEN_MISSING" || e.code === "MISSING_ENV") {
+      return res.status(503).json({
+        errorCode: e.code,
+        message: e.message || "Missing Monday env.",
+      });
+    }
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
 /* ============================================================
 5.0) ✅ PATCH (non-breaking): /api/monday/tickets-normalized
 ============================================================ */
