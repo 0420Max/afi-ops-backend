@@ -1,4 +1,27 @@
-
+/**
+ * =====================================================================
+ * AFI OPS Cockpit — server.js (partitionné)
+ * Date: 2026-01-15
+ *
+ * 🧩 Règle d’or: chaque intégration a son bloc.
+ * Remplacement = copie le bloc complet entre:
+ *    [SERVER:ROUTES_XXX] START  ...  [SERVER:ROUTES_XXX] END
+ *
+ * Index:
+ * - IMPORTS_ENV
+ * - SETUP_MIDDLEWARE_HELPERS
+ * - ROUTES_CORE      (/, /api/version, /api/health)
+ * - ROUTES_VAPI      (/api/vapi/*)
+ * - ROUTES_TWILIO    (/api/twilio-token, /api/voice, /api/conversations/*)
+ * - ROUTES_MONDAY    (/api/monday/*, /api/tickets/*)
+ * - ROUTES_OUTLOOK   (/api/outlook-*, /api/outlook/*)
+ * - ROUTES_GPT       (/api/gpt/*)
+ * - ROUTES_YOUTUBE   (/api/youtube/search)
+ * - ROUTES_MISC      (zapier, tidio, transcript placeholders)
+ * - STARTUP          (listen + diagnostics)
+ * =====================================================================
+ */
+/* [SERVER:IMPORTS_ENV] START */
 /**
  * ============================================================
  * AFI OPS – Backend Central (Render / Local)
@@ -24,6 +47,8 @@ const crypto = require("crypto");
 const fs = require("fs");
 require("dotenv").config();
 
+/* [SERVER:IMPORTS_ENV] END */
+/* [SERVER:SETUP_MIDDLEWARE_HELPERS] START */
 const app = express();
 
 /* ============================================================
@@ -273,6 +298,8 @@ const BUILD = {
 /* ============================================================
 2) HEALTH CHECKS + VERSION
 ============================================================ */
+/* [SERVER:SETUP_MIDDLEWARE_HELPERS] END */
+/* [SERVER:ROUTES_CORE] START */
 app.get("/", (req, res) => {
   res.json({
     status: "AFI OPS Backend OK",
@@ -317,6 +344,8 @@ app.get("/api/health", (req, res) => {
 /* ============================================================
 2.6) VAPI – Console controls + Webhook
 ============================================================ */
+/* [SERVER:ROUTES_CORE] END */
+/* [SERVER:ROUTES_VAPI] START */
 app.get("/api/vapi/status", (req, res) => {
   const last = vapiCalls[0] || null;
   res.json({
@@ -505,6 +534,8 @@ app.post("/api/vapi/webhook", async (req, res) => {
 /* ============================================================
 3) TWILIO – TOKEN + TWIML (Voice)
 ============================================================ */
+/* [SERVER:ROUTES_VAPI] END */
+/* [SERVER:ROUTES_TWILIO] START */
 app.post("/api/twilio-token", (req, res) => {
   if (!TWILIO_ENABLED) {
     return res.status(503).json({
@@ -1008,6 +1039,8 @@ async function fetchMondayItems({ boardId, groupId, limit }) {
   return r.data?.data?.boards?.[0]?.items_page?.items || [];
 }
 
+/* [SERVER:ROUTES_TWILIO] END */
+/* [SERVER:ROUTES_MONDAY] START */
 app.get("/api/monday/tickets", async (req, res) => {
   try {
     const now = Date.now();
@@ -1548,6 +1581,8 @@ function makeStateToken() {
 }
 
 /* ================= OUTLOOK ROUTES ================= */
+/* [SERVER:ROUTES_MONDAY] END */
+/* [SERVER:ROUTES_OUTLOOK] START */
 app.get("/api/outlook-status", async (req, res) => {
   if (!OUTLOOK_CONFIGURED) {
     return res.json({
@@ -1818,6 +1853,8 @@ async function callOpenAI(instructions, input) {
   return r.data?.output_text || "";
 }
 
+/* [SERVER:ROUTES_OUTLOOK] END */
+/* [SERVER:ROUTES_GPT] START */
 app.post("/api/gpt/analyze-ticket", async (req, res) => {
   if (!OPENAI_API_KEY) return res.status(501).json({ error: "GPT disabled" });
   const text = await callOpenAI("Analyse SAV et retourne JSON.", JSON.stringify(req.body));
@@ -1833,6 +1870,8 @@ app.post("/api/gpt/generate-wrap", async (req, res) => {
 /* ============================================================
 9) YOUTUBE SEARCH (server-side => no CORS)
 ============================================================ */
+/* [SERVER:ROUTES_GPT] END */
+/* [SERVER:ROUTES_YOUTUBE] START */
 app.get("/api/youtube/search", async (req, res) => {
   if (!YOUTUBE_API_KEY) return res.json({ items: [] });
 
@@ -1850,6 +1889,8 @@ app.get("/api/youtube/search", async (req, res) => {
 /* ============================================================
 10) ZAPIER SMS
 ============================================================ */
+/* [SERVER:ROUTES_YOUTUBE] END */
+/* [SERVER:ROUTES_MISC] START */
 app.post("/api/zapier/sms", async (req, res) => {
   if (!ZAPIER_SMS_WEBHOOK_URL) return res.status(503).json({ error: "Zapier webhook missing" });
   await axios.post(ZAPIER_SMS_WEBHOOK_URL, req.body, { timeout: 15000 });
@@ -1889,6 +1930,8 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: err.message });
 });
 
+/* [SERVER:ROUTES_MISC] END */
+/* [SERVER:STARTUP] START */
 app.listen(PORT, () => {
   console.log("✅ AFI OPS Backend boot");
   console.log("   baseUrl:", baseUrl);
@@ -1900,3 +1943,22 @@ app.listen(PORT, () => {
   console.log("   twilio.conversations.enabled:", TWILIO_CONVERSATIONS_ENABLED);
   if (!TWILIO_AUTH_TOKEN) console.log("   ⚠️ TWILIO_AUTH_TOKEN missing (webhook signature validation skipped)");
 });
+
+
+
+
+
+
+
+
+
+
+
+
+Backend ENV
+
+
+
+
+
+/* [SERVER:STARTUP] END */
