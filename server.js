@@ -1842,29 +1842,227 @@ app.get("/api/outlook/message/:id", async (req, res) => {
 });
 
 /* ============================================================
-8) GPT – ANALYZE TICKET / GENERATE WRAP
+8) GPT ASSISTANT — AFI OPS Engine
+   /api/gpt/chat  →  analyse ticket + wrap + Paperform URL
 ============================================================ */
-async function callOpenAI(instructions, input) {
-  const r = await axios.post(
-    "https://api.openai.com/v1/responses",
-    { model: OPENAI_MODEL || "gpt-5", instructions, input },
-    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }, timeout: 30000 }
-  );
-  return r.data?.output_text || "";
-}
 
-/* [SERVER:ROUTES_OUTLOOK] END */
-/* [SERVER:ROUTES_GPT] START */
+const AFI_KNOWLEDGE = `
+=== IDENTITÉ & RÔLE ===
+Tu es AFI OPS, l'assistant opérationnel d'AFI. Tu es un cockpit pour les opérations quotidiennes : appels, SAV, logistique, courriels, wraps, gestion des tickets et génération de formulaires Paperform.
+Tu travailles avec Max, jamais pour Max. Tu exécutes vite, proprement, sans bruit.
+
+=== RÈGLES DE BASE ===
+- Source unique de vérité : les fichiers .md fournis.
+- Aucun prix, SKU, inventaire inventé.
+- Aucun envoi automatisé sans confirmation de Max — sauf génération de lien Paperform prérempli.
+- Tu restes 100% aligné avec les fichiers .md.
+
+=== MODES D'INTERACTION ===
+Mode APPEL (par défaut) : réponses conversationnelles, concises, humaines.
+Mode COURRIEL : activé si adresse email fournie → wrap professionnel AFI.
+
+=== MODULE PAPERFORM ===
+BASE_URL = https://3hzypgle.paperform.co/
+Paramètres Paperform :
+- Langue: 6ft14 (fr=--1--, en=--2--)
+- Type client: 5c5in (résidentiel=--1--, employé AFI=--2--, vendeur=--3--, livreur=--4--)
+- Type demande: 8g90v (service=--1--, achat=--2--)
+- Type service: b15nb (ouverture=--1--, livraison incomplète=--2--, garantie=--3--, bris/remplacement=--4--, gelcoat=--5--, raccordement=--6--, test pression=--7--, fermeture=--8--)
+- Type bassin: 7eq1e (piscine=--1--, spa=--2--)
+- Équipement: btbs2 (spa=--1--, piscine=--2--, chauffe-eau=--3--, pompe=--4--, filtre=--5--, éclairage=--6--, couvert=--7--, système sel=--8--, thermopompe=--9--, soufflerie=--10--)
+- Urgence: 2gij8 (urgent=--1--, important=--2--, standard=--3--, incertain=--4--)
+- Nom: 2cet5 (texte encodé URL, espaces → +)
+- Adresse: atchp (format: Canada%2CPOSTAL%2CQC%2CVille%2CRue+Numero)
+- Téléphone: 9jjlv
+- Courriel: fj2co (@ → %40)
+- Modèle/série: ca7j
+- Description problème: 27t5o
+
+Quand tu génères un lien Paperform → affiche TOUJOURS:
+1. Un résumé humain complet
+2. Le lien cliquable: 🔗 Ouvrir le formulaire Paperform
+3. La phrase: "🔗 Voici le lien Paperform prêt à ouvrir pour vérification ou soumission manuelle."
+Ne jamais demander "souhaites-tu que je génère le lien?" — le générer directement.
+
+=== GARANTIES (résumé) ===
+- Pompes Moov AI/VSP: 3 ans pièces + 3 ans MO fabricant
+- Systèmes au sel: 2-3 ans (cellule 1 an)
+- Lumières: 1 an
+- Thermopompes: 5-10 ans selon modèle
+- Main-d'œuvre AFI toujours facturable sauf si pose initiale fautive
+- Transport toujours exclu de la garantie
+
+=== CODES ERREUR SPA ===
+FLO: débit insuffisant → vérifier pompe/filtre/niveau eau
+OH: surchauffe → vérifier capteur/circulation
+DR: drain → vérifier niveau eau
+COOL: température basse → vérifier mode chauffage
+ECO: mode économie → changement manuel requis
+
+=== PARAMÈTRES EAU ===
+Piscine: pH 7.2-7.6 | Chlore 1-3 ppm | Alcalinité 80-120 ppm | Stabilisant 30-50 ppm | Sel 3200-3400 ppm
+Spa: pH 7.2-7.6 | Brome 3-5 ppm | Chlore 1-3 ppm | Alcalinité 80-120 ppm | Dureté 150-250 ppm
+
+=== POMPES ===
+Pas de démarrage + aucun bruit → vérifier disjoncteur
+Bourdonnement → condensateur défectueux
+Grincement → roulement à bille
+Gargarisme → air dans la pompe
+Pompe Moov AI sans débit → basculer mode GPM → monter à 100 GPM
+
+=== CONTACTS FOURNISSEURS ===
+Moov: service@moovpool.com / 450-804-5222 | Vincent Racine: 450-328-5858
+Gecko Alliance: Richard Lachance – geckodepot.com
+O'Ryan: Rick Grant – rickg@oryanindustries.com / 1-800-426-4311
+Fibre de Verre Québec: 418-906-5936
+Bugeau Multi Service: 514-291-1878
+
+=== WRAP SAV ===
+Chaque wrap inclut: questions utiles, photos/vidéos à demander, étapes sécuritaires.
+Ne jamais demander d'ouvrir composantes électriques à un client résidentiel.
+
+=== OPS ENGINE (Routine AUTO) ===
+Pour chaque ticket analysé, produire 3 blocs:
+A) Résumé N1 (client, intent, équipement, symptômes, manquants, prochaine étape)
+B) Actions internes AFI (collecte infos, garantie, stock, wrap, escalade)
+C) Actions terrain si applicable (sinon N/A)
+
+=== STYLE ===
+Direct, complice, efficace. Humour vif si approprié. Jamais de poésie.
+Réponses 90% prêtes à envoyer, Max ajuste les 10% restants.
+`;
+
+app.post("/api/gpt/chat", async (req, res) => {
+  if (!OPENAI_API_KEY) {
+    return res.status(501).json({
+      ok: false,
+      error: "GPT_DISABLED",
+      message: "OPENAI_API_KEY manquante."
+    });
+  }
+
+  const { message, ticket, context } = req.body || {};
+
+  if (!message && !ticket) {
+    return res.status(400).json({
+      ok: false,
+      error: "MISSING_INPUT",
+      message: "message ou ticket requis."
+    });
+  }
+
+  // Construction du contexte ticket
+  const ticketBlock = ticket ? `
+=== TICKET ACTIF ===
+ID Monday: ${ticket.id || "—"}
+Client: ${ticket.client || ticket.customerName || "—"}
+Titre complet: ${ticket.title || "—"}
+Statut: ${ticket.status || "—"}
+Priorité: ${ticket.priority || "—"}
+Téléphone: ${ticket.phone || "—"}
+Email: ${ticket.email || "—"}
+Adresse: ${ticket.address || ticket.location || "—"}
+Problème décrit: ${ticket.problem || "—"}
+Wrap existant: ${ticket.wrap || "—"}
+Actions existantes: ${ticket.actions || "—"}
+Groupe Monday: ${ticket.groupTitle || "—"}
+=== FIN TICKET ===
+` : "";
+
+  const userMsg = [
+    ticketBlock,
+    message || "Analyse ce ticket SAV et donne-moi le Résumé N1 + Actions internes + prochaine étape."
+  ].filter(Boolean).join("\n\n");
+
+  try {
+    const response = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: process.env.OPENAI_MODEL || "gpt-4o",
+        messages: [
+          { role: "system", content: AFI_KNOWLEDGE },
+          { role: "user",   content: userMsg }
+        ],
+        temperature: 0.25,
+        max_tokens: 2000
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        timeout: 35000
+      }
+    );
+
+    const text = response.data?.choices?.[0]?.message?.content || "";
+
+    // Détecter création ticket Monday si demandée
+    let mondayResult = null;
+    let actionDetected = null;
+
+    const jsonBlock = text.match(/```json\s*([\s\S]*?)\s*```/i);
+    if (jsonBlock) {
+      try {
+        const parsed = JSON.parse(jsonBlock[1].trim());
+        if (parsed?.action === "create_ticket" && MONDAY_TOKEN) {
+          actionDetected = "create_ticket";
+          const itemName = `SAV • ${parsed.clientName || ticket?.client || "Inconnu"} • ${parsed.reason || "Support"}`.slice(0, 160);
+
+          const colVals = {};
+          if (parsed.email)   colVals["email_mkctw7qd"]      = { email: parsed.email, text: parsed.email };
+          if (parsed.phone)   colVals["phone_mkcrrn8p"]      = { phone: parsed.phone, countryShortName: "CA" };
+          if (parsed.address) colVals["text_mkc4er9w"]        = parsed.address;
+          if (parsed.details) colVals["long_text_mkctw6z7"]   = { text: parsed.details.slice(0, 8000) };
+
+          const mut = `
+            mutation ($boardId: ID!, $groupId: String!, $name: String!, $cols: JSON!) {
+              create_item(board_id: $boardId, group_id: $groupId, item_name: $name, column_values: $cols) { id name }
+            }`;
+
+          const mr = await mondayRequest(mut, {
+            boardId: Number(DEFAULT_BOARD_ID),
+            groupId: DEFAULT_GROUP_ID,
+            name: itemName,
+            cols: JSON.stringify(colVals)
+          });
+
+          const created = mr.data?.data?.create_item;
+          if (created?.id) {
+            mondayCache.data = null;
+            mondayResult = { ok: true, itemId: String(created.id), itemName: created.name };
+          }
+        }
+      } catch (e) {
+        console.warn("[GPT/CHAT] JSON parse (non-fatal):", e?.message);
+      }
+    }
+
+    res.json({
+      ok: true,
+      response: text,
+      actionDetected,
+      mondayResult,
+      model: response.data?.model || "gpt-4o",
+      usage: response.data?.usage || null
+    });
+
+  } catch (e) {
+    const status = e?.response?.status || 500;
+    const details = e?.response?.data || { error: e?.message || "openai_error" };
+    console.error("[GPT/CHAT]", status, details);
+    res.status(status).json({ ok: false, error: "GPT_ERROR", details });
+  }
+});
+
 app.post("/api/gpt/analyze-ticket", async (req, res) => {
-  if (!OPENAI_API_KEY) return res.status(501).json({ error: "GPT disabled" });
-  const text = await callOpenAI("Analyse SAV et retourne JSON.", JSON.stringify(req.body));
-  res.json({ ok: true, analysis: text });
+  req.body.message = "Génère le Résumé N1 complet + Actions internes AFI + Actions terrain pour ce ticket.";
+  return app._router.handle({ ...req, url: "/api/gpt/chat", path: "/api/gpt/chat" }, res, () => {});
 });
 
 app.post("/api/gpt/generate-wrap", async (req, res) => {
-  if (!OPENAI_API_KEY) return res.status(501).json({ error: "GPT disabled" });
-  const text = await callOpenAI("Génère un wrap SAV structuré.", JSON.stringify(req.body));
-  res.json({ ok: true, wrap: text });
+  req.body.message = "Génère un wrap SAV complet pour ce ticket. Inclus les questions, photos à demander et prochaines étapes. Si adresse disponible, génère aussi le lien Paperform prérempli.";
+  return app._router.handle({ ...req, url: "/api/gpt/chat", path: "/api/gpt/chat" }, res, () => {});
 });
 
 /* ============================================================
