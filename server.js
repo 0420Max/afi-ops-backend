@@ -3,7 +3,7 @@
  * AFI OPS Cockpit — server.js (partitionné)
  * Date: 2026-01-15
  *
- * 🧩 Règle d’or: chaque intégration a son bloc.
+ * 🧩 Règle d'or: chaque intégration a son bloc.
  * Remplacement = copie le bloc complet entre:
  *    [SERVER:ROUTES_XXX] START  ...  [SERVER:ROUTES_XXX] END
  *
@@ -18,6 +18,7 @@
  * - ROUTES_GPT       (/api/gpt/*)
  * - ROUTES_YOUTUBE   (/api/youtube/search)
  * - ROUTES_MISC      (zapier, tidio, transcript placeholders)
+ * - ROUTES_AUTOMATIONS (monday-automations-v3)
  * - STARTUP          (listen + diagnostics)
  * =====================================================================
  */
@@ -206,17 +207,17 @@ function pushVapiCall(update) {
 function buildTransientVapiAssistant() {
   // Minimal assistant if you don't want to maintain a saved assistant in the dashboard.
   const sys = `
-Tu es l’agent vocal SAV AFI.
+Tu es l'agent vocal SAV AFI.
 
 Objectif:
-1) Diagnostiquer et tenter 1 à 2 actions d’assistance rapides.
-2) Dans TOUS les cas, créer un ticket de demande d’assistance.
+1) Diagnostiquer et tenter 1 à 2 actions d'assistance rapides.
+2) Dans TOUS les cas, créer un ticket de demande d'assistance.
 
 Règles:
-- Avant de terminer l’appel, tu DOIS obtenir: nom complet, courriel, téléphone, adresse de service.
+- Avant de terminer l'appel, tu DOIS obtenir: nom complet, courriel, téléphone, adresse de service.
 - Résume le problème, les vérifications faites, et les infos techniques (type de bassin, modèle, numéro de série, etc.).
-- Ensuite appelle l’outil create_support_ticket avec tous les champs.
-- Si une info manque, insiste poliment et guide l’utilisateur pour la trouver.
+- Ensuite appelle l'outil create_support_ticket avec tous les champs.
+- Si une info manque, insiste poliment et guide l'utilisateur pour la trouver.
 `.trim();
 
   return {
@@ -1932,6 +1933,8 @@ Direct, complice, efficace. Humour vif si approprié. Jamais de poésie.
 Réponses 90% prêtes à envoyer, Max ajuste les 10% restants.
 `;
 
+/* [SERVER:ROUTES_OUTLOOK] END */
+/* [SERVER:ROUTES_GPT] START */
 app.post("/api/gpt/chat", async (req, res) => {
   if (!OPENAI_API_KEY) {
     return res.status(501).json({
@@ -2121,7 +2124,7 @@ function escapeHtml(s) {
 }
 
 /* ============================================================
-14) ERROR HANDLER + START
+14) ERROR HANDLER
 ============================================================ */
 app.use((err, req, res, next) => {
   console.error("[ERROR]", err);
@@ -2129,6 +2132,13 @@ app.use((err, req, res, next) => {
 });
 
 /* [SERVER:ROUTES_MISC] END */
+
+/* [SERVER:ROUTES_AUTOMATIONS] START */
+// ── Automations Services v3 (gardes, SLA conditionnel, auto-assign) ──
+const mondayAutomations = require('./monday-automations-v3');
+mondayAutomations.register(app);
+/* [SERVER:ROUTES_AUTOMATIONS] END */
+
 /* [SERVER:STARTUP] START */
 app.listen(PORT, () => {
   console.log("✅ AFI OPS Backend boot");
@@ -2139,8 +2149,7 @@ app.listen(PORT, () => {
   console.log("   outlook.configured:", OUTLOOK_CONFIGURED);
   console.log("   twilio.voice.enabled:", TWILIO_ENABLED);
   console.log("   twilio.conversations.enabled:", TWILIO_CONVERSATIONS_ENABLED);
+  console.log("   monday.automations.v3:", "registered");
   if (!TWILIO_AUTH_TOKEN) console.log("   ⚠️ TWILIO_AUTH_TOKEN missing (webhook signature validation skipped)");
 });
-
-
 /* [SERVER:STARTUP] END */
