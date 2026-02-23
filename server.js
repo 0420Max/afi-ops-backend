@@ -3,7 +3,7 @@
  * AFI OPS Cockpit — server.js (partitionné)
  * Date: 2026-01-15
  *
- * 🧩 Règle d’or: chaque intégration a son bloc.
+ * 🧩 Règle d'or: chaque intégration a son bloc.
  * Remplacement = copie le bloc complet entre:
  *    [SERVER:ROUTES_XXX] START  ...  [SERVER:ROUTES_XXX] END
  *
@@ -18,6 +18,7 @@
  * - ROUTES_GPT       (/api/gpt/*)
  * - ROUTES_YOUTUBE   (/api/youtube/search)
  * - ROUTES_MISC      (zapier, tidio, transcript placeholders)
+ * - ROUTES_AUTOMATIONS (monday-automations-v3)
  * - STARTUP          (listen + diagnostics)
  * =====================================================================
  */
@@ -154,8 +155,8 @@ const {
 
 } = process.env;
 
-const DEFAULT_BOARD_ID = Number(MONDAY_BOARD_ID || 1763228524);
-const DEFAULT_GROUP_ID = String(MONDAY_GROUP_ID || "topics");
+const DEFAULT_BOARD_ID = Number(MONDAY_BOARD_ID || 18290169368);
+const DEFAULT_GROUP_ID = String(MONDAY_GROUP_ID || "topics"); // 📥 Nouvelles demandes (Services v3)
 const MONDAY_LIMIT = Number(MONDAY_ITEMS_LIMIT || 50);
 const MONDAY_TTL = Number(MONDAY_TTL_MS || 25000);
 const MONDAY_VERSION = MONDAY_API_VERSION || "2023-10";
@@ -206,17 +207,17 @@ function pushVapiCall(update) {
 function buildTransientVapiAssistant() {
   // Minimal assistant if you don't want to maintain a saved assistant in the dashboard.
   const sys = `
-Tu es l’agent vocal SAV AFI.
+Tu es l'agent vocal SAV AFI.
 
 Objectif:
-1) Diagnostiquer et tenter 1 à 2 actions d’assistance rapides.
-2) Dans TOUS les cas, créer un ticket de demande d’assistance.
+1) Diagnostiquer et tenter 1 à 2 actions d'assistance rapides.
+2) Dans TOUS les cas, créer un ticket de demande d'assistance.
 
 Règles:
-- Avant de terminer l’appel, tu DOIS obtenir: nom complet, courriel, téléphone, adresse de service.
+- Avant de terminer l'appel, tu DOIS obtenir: nom complet, courriel, téléphone, adresse de service.
 - Résume le problème, les vérifications faites, et les infos techniques (type de bassin, modèle, numéro de série, etc.).
-- Ensuite appelle l’outil create_support_ticket avec tous les champs.
-- Si une info manque, insiste poliment et guide l’utilisateur pour la trouver.
+- Ensuite appelle l'outil create_support_ticket avec tous les champs.
+- Si une info manque, insiste poliment et guide l'utilisateur pour la trouver.
 `.trim();
 
   return {
@@ -253,8 +254,8 @@ Règles:
 }
 
 
-const STATUS_COL = MONDAY_STATUS_COLUMN_ID || "status";
-const ASSIGNEE_COL = MONDAY_ASSIGNEE_COLUMN_ID || "person";
+const STATUS_COL = MONDAY_STATUS_COLUMN_ID || "color_mkx55mz3"; // Statut (Services v3)
+const ASSIGNEE_COL = MONDAY_ASSIGNEE_COLUMN_ID || "person"; // Assigné à (Services v3)
 
 const TWILIO_ENABLED =
   !!TWILIO_ACCOUNT_SID &&
@@ -911,18 +912,18 @@ async function createSupportTicketFromVoice(payload, vapiMessage) {
   const name = String(payload?.clientName || "Inconnu").trim();
   const itemName = `SAV • ${name} • ${reason}`.slice(0, 160);
 
-  // Column IDs (override via ENV if your board differs)
+  // Column IDs — Services v3 (board 18290169368)
   const COL = {
-    email: process.env.MONDAY_COL_EMAIL || "email_mkctw7qd",
-    phone: process.env.MONDAY_COL_PHONE || "phone_mkcrrn8p",
-    address: process.env.MONDAY_COL_ADDRESS || "text_mkc4er9w",
-    description: process.env.MONDAY_COL_DESC || "long_text_mkctw6z7",
-    status: process.env.MONDAY_STATUS_COLUMN_ID || "status",
-    source: process.env.MONDAY_COL_SOURCE || null,
+    email: process.env.MONDAY_COL_EMAIL || "email_mkx53410",
+    phone: process.env.MONDAY_COL_PHONE || "phone_mkx5xy3x",
+    address: process.env.MONDAY_COL_ADDRESS || "text_mkx528gx",
+    description: process.env.MONDAY_COL_DESC || "long_text_mkx59qsr",
+    status: process.env.MONDAY_STATUS_COLUMN_ID || "color_mkx55mz3",
+    source: process.env.MONDAY_COL_SOURCE || "color_mkx5d0mh",
     callId: process.env.MONDAY_COL_CALL_ID || null,
-    model: process.env.MONDAY_COL_MODEL || null,
+    model: process.env.MONDAY_COL_MODEL || "text_mkx5f45n",
     serial: process.env.MONDAY_COL_SERIAL || null,
-    poolType: process.env.MONDAY_COL_POOLTYPE || null
+    poolType: process.env.MONDAY_COL_POOLTYPE || "color_mkx6fxga"
   };
 
   const columnValues = {};
@@ -1932,6 +1933,8 @@ Direct, complice, efficace. Humour vif si approprié. Jamais de poésie.
 Réponses 90% prêtes à envoyer, Max ajuste les 10% restants.
 `;
 
+/* [SERVER:ROUTES_OUTLOOK] END */
+/* [SERVER:ROUTES_GPT] START */
 app.post("/api/gpt/chat", async (req, res) => {
   if (!OPENAI_API_KEY) {
     return res.status(501).json({
@@ -2010,10 +2013,10 @@ Groupe Monday: ${ticket.groupTitle || "—"}
           const itemName = `SAV • ${parsed.clientName || ticket?.client || "Inconnu"} • ${parsed.reason || "Support"}`.slice(0, 160);
 
           const colVals = {};
-          if (parsed.email)   colVals["email_mkctw7qd"]      = { email: parsed.email, text: parsed.email };
-          if (parsed.phone)   colVals["phone_mkcrrn8p"]      = { phone: parsed.phone, countryShortName: "CA" };
-          if (parsed.address) colVals["text_mkc4er9w"]        = parsed.address;
-          if (parsed.details) colVals["long_text_mkctw6z7"]   = { text: parsed.details.slice(0, 8000) };
+          if (parsed.email)   colVals["email_mkx53410"]      = { email: parsed.email, text: parsed.email };
+          if (parsed.phone)   colVals["phone_mkx5xy3x"]      = { phone: parsed.phone, countryShortName: "CA" };
+          if (parsed.address) colVals["text_mkx528gx"]        = parsed.address;
+          if (parsed.details) colVals["long_text_mkx59qsr"]   = { text: parsed.details.slice(0, 8000) };
 
           const mut = `
             mutation ($boardId: ID!, $groupId: String!, $name: String!, $cols: JSON!) {
@@ -2121,7 +2124,7 @@ function escapeHtml(s) {
 }
 
 /* ============================================================
-14) ERROR HANDLER + START
+14) ERROR HANDLER
 ============================================================ */
 app.use((err, req, res, next) => {
   console.error("[ERROR]", err);
@@ -2129,6 +2132,13 @@ app.use((err, req, res, next) => {
 });
 
 /* [SERVER:ROUTES_MISC] END */
+
+/* [SERVER:ROUTES_AUTOMATIONS] START */
+// ── Automations Services v3 (gardes, SLA conditionnel, auto-assign) ──
+const mondayAutomations = require('./monday-automations-v3');
+mondayAutomations.register(app);
+/* [SERVER:ROUTES_AUTOMATIONS] END */
+
 /* [SERVER:STARTUP] START */
 app.listen(PORT, () => {
   console.log("✅ AFI OPS Backend boot");
@@ -2139,8 +2149,7 @@ app.listen(PORT, () => {
   console.log("   outlook.configured:", OUTLOOK_CONFIGURED);
   console.log("   twilio.voice.enabled:", TWILIO_ENABLED);
   console.log("   twilio.conversations.enabled:", TWILIO_CONVERSATIONS_ENABLED);
+  console.log("   monday.automations.v3:", "registered");
   if (!TWILIO_AUTH_TOKEN) console.log("   ⚠️ TWILIO_AUTH_TOKEN missing (webhook signature validation skipped)");
 });
-
-
 /* [SERVER:STARTUP] END */
