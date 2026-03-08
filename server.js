@@ -1949,16 +1949,16 @@ app.post("/api/gpt/chat", async (req, res) => {
     });
   }
 
-    if (!message && !ticket) {
+    // Construction du contexte ticket
+  const { message, ticket, context, email } = req.body || {};
+
+  if (!message && !ticket) {
     return res.status(400).json({
       ok: false,
       error: "MISSING_INPUT",
       message: "message ou ticket requis."
     });
   }
-
-// Construction du contexte ticket
-  const { message, ticket, context, email } = req.body || {};
 
   const ticketBlock = ticket ? `
 === TICKET ACTIF ===
