@@ -1949,9 +1949,7 @@ app.post("/api/gpt/chat", async (req, res) => {
     });
   }
 
-  const { message, ticket, context } = req.body || {};
-
-  if (!message && !ticket) {
+    if (!message && !ticket) {
     return res.status(400).json({
       ok: false,
       error: "MISSING_INPUT",
@@ -1959,7 +1957,9 @@ app.post("/api/gpt/chat", async (req, res) => {
     });
   }
 
-  // Construction du contexte ticket
+// Construction du contexte ticket
+  const { message, ticket, context, email } = req.body || {};
+
   const ticketBlock = ticket ? `
 === TICKET ACTIF ===
 ID Monday: ${ticket.id || "—"}
@@ -1977,8 +1977,19 @@ Groupe Monday: ${ticket.groupTitle || "—"}
 === FIN TICKET ===
 ` : "";
 
+  const emailBlock = email ? `
+=== COURRIEL OUTLOOK ACTIF ===
+De: ${email.fromName || "—"} <${email.fromAddr || "—"}>
+Objet: ${email.subject || "—"}
+Reçu: ${email.received || "—"}
+Contenu:
+${email.body || email.preview || "(vide)"}
+=== FIN COURRIEL ===
+` : "";
+
   const userMsg = [
     ticketBlock,
+    emailBlock,
     message || "Analyse ce ticket SAV et donne-moi le Résumé N1 + Actions internes + prochaine étape."
   ].filter(Boolean).join("\n\n");
 
@@ -2002,7 +2013,6 @@ Groupe Monday: ${ticket.groupTitle || "—"}
         timeout: 35000
       }
     );
-
     const text = response.data?.choices?.[0]?.message?.content || "";
 
     // Détecter création ticket Monday si demandée
