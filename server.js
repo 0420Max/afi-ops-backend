@@ -1048,7 +1048,7 @@ app.get("/api/monday/tickets", async (req, res) => {
     if (mondayCache.data && mondayCache.expiresAt > now) return res.json(mondayCache.data);
 
     const boardId = Number(req.query.boardId || DEFAULT_BOARD_ID);
-    const groupId = String(req.query.groupId || DEFAULT_GROUP_ID);
+    const groupId = req.query.groupId || null;  // ← null = tous les groupes
     const limit = Math.max(1, Math.min(200, Number(req.query.limit || MONDAY_LIMIT)));
 
     const items = await fetchMondayItems({ boardId, groupId, limit });
