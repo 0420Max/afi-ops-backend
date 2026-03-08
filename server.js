@@ -2139,9 +2139,7 @@ app.use((err, req, res, next) => {
 /* [SERVER:ROUTES_MISC] END */
 
 /* [SERVER:ROUTES_AUTOMATIONS] START */
-// ── Automations Services v3 (gardes, SLA conditionnel, auto-assign) ──
-const mondayAutomations = require('./monday-automations-v3');
-mondayAutomations.register(app);
+// ── Automations v3 (désactivé temporairement) ──
 /* [SERVER:ROUTES_AUTOMATIONS] END */
 
 /* [SERVER:STARTUP] START */
