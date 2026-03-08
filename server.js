@@ -1441,13 +1441,18 @@ app.patch("/api/tickets/:id", async (req, res) => {
     }
 
     if (req.body?.status) {
-      const mutation = `
-        mutation ($itemId: ID!, $val: String!) {
-          change_simple_column_value(item_id: $itemId, board_id: ${DEFAULT_BOARD_ID}, column_id: "${STATUS_COL}", value: $val) { id }
-        }
-      `;
-      ops.push(mondayRequest(mutation, { itemId, val: String(req.body.status) }));
+  const mutation = `
+    mutation ($itemId: ID!, $boardId: ID!, $columnId: String!, $value: JSON!) {
+      change_column_value(item_id: $itemId, board_id: $boardId, column_id: $columnId, value: $value) { id }
     }
+  `;
+  ops.push(mondayRequest(mutation, {
+    itemId,
+    boardId: DEFAULT_BOARD_ID,
+    columnId: STATUS_COL,
+    value: JSON.stringify({ label: String(req.body.status) })
+  }));
+}
 
     if (req.body?.assigneeId) {
       const assigneeId = Number(req.body.assigneeId);
