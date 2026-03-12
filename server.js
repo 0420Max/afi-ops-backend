@@ -1587,20 +1587,16 @@ function makeStateToken() {
 }
 
 /* ================= OUTLOOK ROUTES ================= */
-
+app.get("/api/monday/inventaire", async (req, res) => {
+  try {
+    const query = `query { boards(ids: [18396859733]) { groups { id title items_page(limit: 100) { items { id name column_values(ids: ["text_mm07b8w2","numeric_mm0p36g4","numeric_mkzvqrdh","numeric_mkzvj9j6"]) { id text } } } } } }`;
+    const r = await mondayRequest(query, {});
+    res.json(r.data?.data?.boards?.[0]?.groups || []);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 /* [SERVER:ROUTES_MONDAY] END */
 /* [SERVER:ROUTES_OUTLOOK] START */
-app.get("/api/outlook-status", async (req, res) => {
-  if (!OUTLOOK_CONFIGURED) {
-    return res.json({
-      ok: true,
-      configured: false,
-      connected: false,
-      message: "Outlook env not configured",
-    });
-  }
 
-  await refreshOutlookTokenIfNeeded();
 app.get("/api/outlook-status", async (req, res) => {
   if (!OUTLOOK_CONFIGURED) {
     return res.json({
