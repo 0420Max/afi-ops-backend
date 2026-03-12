@@ -1688,6 +1688,98 @@ app.post("/api/stripe/create-invoice", async (req, res) => {
     res.status(500).json({ ok: false, error: e?.message || "STRIPE_ERROR" });
   }
 });
+/* ============================================================
+SUBITEMS – CRUD
+============================================================ */
+
+// GET /api/monday/subitems/:itemId
+app.get("/api/monday/subitems/:itemId", async (req, res) => {
+  try {
+    const itemId = String(req.params.itemId);
+    const query = `
+      query ($itemId: ID!) {
+        items(ids: [$itemId]) {
+          subitems {
+            id name
+            column_values(ids: [
+              "dropdown_mkx5vwp2","numeric_mkx51055","numeric_mkx5jz5g",
+              "formula_mkx5x427","numeric_mkx51q57","dropdown_mkx5m22s","text_mm1bp49m"
+            ]) { id text }
+          }
+        }
+      }
+    `;
+    const r = await mondayRequest(query, { itemId });
+    const subitems = r.data?.data?.items?.[0]?.subitems || [];
+    res.json({ ok: true, subitems });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// POST /api/monday/subitems — créer un sous-élément
+app.post("/api/monday/subitems", async (req, res) => {
+  try {
+    const { parentId, name, type, qty, tarif, sku } = req.body;
+    if (!parentId || !name) return res.status(400).json({ ok: false, error: "parentId + name requis" });
+
+    const cols = {};
+    if (type)  cols["dropdown_mkx5vwp2"] = { labels: [type] };
+    if (qty)   cols["numeric_mkx51055"]  = String(qty);
+    if (tarif) cols["numeric_mkx5jz5g"]  = String(tarif);
+    if (sku)   cols["text_mm1bp49m"]     = String(sku);
+
+    const mutation = `
+      mutation ($parentId: ID!, $name: String!, $cols: JSON!) {
+        create_subitem(parent_item_id: $parentId, item_name: $name, column_values: $cols) { id name }
+      }
+    `;
+    const r = await mondayRequest(mutation, { parentId: String(parentId), name, cols: JSON.stringify(cols) });
+    mondayCache.data = null;
+    res.json({ ok: true, subitem: r.data?.data?.create_subitem });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// PATCH /api/monday/subitems/:id — modifier un sous-élément
+app.patch("/api/monday/subitems/:id", async (req, res) => {
+  try {
+    const subitemId = String(req.params.id);
+    const { name, type, qty, tarif, sku } = req.body;
+
+    const cols = {};
+    if (type  !== undefined) cols["dropdown_mkx5vwp2"] = { labels: [type] };
+    if (qty   !== undefined) cols["numeric_mkx51055"]  = String(qty);
+    if (tarif !== undefined) cols["numeric_mkx5jz5g"]  = String(tarif);
+    if (sku   !== undefined) cols["text_mm1bp49m"]     = String(sku);
+
+    const ops = [];
+    if (Object.keys(cols).length) {
+      ops.push(mondayRequest(`
+        mutation ($id: ID!, $cols: JSON!) {
+          change_multiple_column_values(item_id: $id, board_id: 18291610020, column_values: $cols) { id }
+        }`, { id: subitemId, cols: JSON.stringify(cols) }));
+    }
+    if (name) {
+      ops.push(mondayRequest(`
+        mutation ($id: ID!, $name: String!) {
+          change_item_name(board_id: 18291610020, item_id: $id, new_name: $name) { id }
+        }`, { id: subitemId, name }));
+    }
+    if (ops.length) await Promise.allSettled(ops);
+    mondayCache.data = null;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// DELETE /api/monday/subitems/:id
+app.delete("/api/monday/subitems/:id", async (req, res) => {
+  try {
+    const subitemId = String(req.params.id);
+    await mondayRequest(`
+      mutation ($id: ID!) { delete_item(item_id: $id) { id } }
+    `, { id: subitemId });
+    mondayCache.data = null;
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
 /* [SERVER:ROUTES_MONDAY] END */
 /* [SERVER:ROUTES_OUTLOOK] START */
 
