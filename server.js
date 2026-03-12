@@ -1586,23 +1586,6 @@ function makeStateToken() {
   return crypto.randomBytes(18).toString("hex");
 }
 
-   outlookStore.expires_at = nowMs() + Number(data.expires_in || 0) * 1000;
-    outlookStore.connected = !!outlookStore.access_token;
-    outlookStore.last_error = null;
-    outlookStore.last_connected_at = new Date().toISOString();
-
-    saveOutlookTokens();
-    return outlookStore.access_token;
-  } catch (e) {
-    outlookStore.last_error = e?.response?.data || e?.message || "refresh_failed";
-    return null;
-  }
-}
-
-function makeStateToken() {
-  return crypto.randomBytes(18).toString("hex");
-}
-
 /* ================= OUTLOOK ROUTES ================= */
 
 /* [SERVER:ROUTES_MONDAY] END */
