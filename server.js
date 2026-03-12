@@ -1600,6 +1600,94 @@ app.get("/api/monday/inventaire", async (req, res) => {
     res.json(r.data?.data?.boards?.[0]?.groups || []);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+/* ============================================================
+STRIPE – CREATE INVOICE FROM TICKET SUBITEMS
+POST /api/stripe/create-invoice
+Body: { ticketId, clientName, email, subitems: [{name, qty, unitPrice, type}] }
+============================================================ */
+app.post("/api/stripe/create-invoice", async (req, res) => {
+  if (!stripe) return res.status(503).json({ ok: false, error: "STRIPE_NOT_CONFIGURED" });
+
+  const { ticketId, clientName, email, subitems } = req.body || {};
+  if (!email) return res.status(400).json({ ok: false, error: "MISSING_EMAIL" });
+  if (!subitems?.length) return res.status(400).json({ ok: false, error: "MISSING_SUBITEMS" });
+
+  try {
+    // 1. Trouver ou créer le customer Stripe
+    const existing = await stripe.customers.list({ email, limit: 1 });
+    let customer;
+    if (existing.data.length > 0) {
+      customer = existing.data[0];
+    } else {
+      customer = await stripe.customers.create({
+        email,
+        name: clientName || email,
+        metadata: { source: "AFI_OPS_CONSOLE", mondayTicketId: String(ticketId || "") }
+      });
+    }
+
+    // 2. Créer les invoice items (une ligne par sous-élément)
+    for (const item of subitems) {
+      const qty = Math.max(1, Number(item.qty) || 1);
+      const unitPrice = Math.round((Number(item.unitPrice) || 0) * 100); // cents
+      if (unitPrice <= 0) continue;
+
+      await stripe.invoiceItems.create({
+        customer: customer.id,
+        amount: unitPrice * qty,
+        currency: "cad",
+        description: item.name || item.type || "Service AFI",
+        metadata: { type: item.type || "", mondayTicketId: String(ticketId || "") }
+      });
+    }
+
+    // 3. Créer la facture
+    const invoice = await stripe.invoices.create({
+      customer: customer.id,
+      collection_method: "send_invoice",
+      days_until_due: 30,
+      currency: "cad",
+      metadata: { mondayTicketId: String(ticketId || ""), source: "AFI_OPS_CONSOLE" },
+      description: ticketId ? `Ticket AFI #${ticketId}` : "Services AFI",
+      footer: "Merci de votre confiance — AFI Piscines & Spas"
+    });
+
+    // 4. Finaliser + envoyer
+    const finalized = await stripe.invoices.finalizeInvoice(invoice.id);
+    await stripe.invoices.sendInvoice(finalized.id);
+
+    // 5. Sauvegarder le lien dans la colonne "Lien Stripe" du ticket Monday
+    if (ticketId && finalized.hosted_invoice_url) {
+      const mutation = `
+        mutation ($itemId: ID!, $cols: JSON!) {
+          change_multiple_column_values(item_id: $itemId, board_id: ${DEFAULT_BOARD_ID}, column_values: $cols) { id }
+        }
+      `;
+      await mondayRequest(mutation, {
+        itemId: String(ticketId),
+        cols: JSON.stringify({
+          "link_mkx5kzkv": { url: finalized.hosted_invoice_url, text: `Facture #${finalized.number}` }
+        })
+      }).catch(() => {}); // non-bloquant
+      mondayCache.data = null;
+    }
+
+    res.json({
+      ok: true,
+      invoiceId: finalized.id,
+      invoiceNumber: finalized.number,
+      invoiceUrl: finalized.hosted_invoice_url,
+      pdfUrl: finalized.invoice_pdf,
+      amountDue: finalized.amount_due / 100,
+      currency: finalized.currency,
+      customerEmail: email
+    });
+
+  } catch (e) {
+    console.error("[STRIPE/CREATE-INVOICE]", e?.message);
+    res.status(500).json({ ok: false, error: e?.message || "STRIPE_ERROR" });
+  }
+});
 /* [SERVER:ROUTES_MONDAY] END */
 /* [SERVER:ROUTES_OUTLOOK] START */
 
