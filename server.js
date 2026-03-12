@@ -1230,7 +1230,7 @@ app.post("/api/tickets/quick-create", async (req, res) => {
       { query: mutation, variables },
       {
         headers: {
-          Authorization: process.env.MONDAY_API_KEY,
+          Authorization: process.env.MONDAY_TOKEN,
           "Content-Type": "application/json",
         },
       }
