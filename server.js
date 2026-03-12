@@ -46,6 +46,7 @@ const axios = require("axios");
 const cors = require("cors");
 const crypto = require("crypto");
 const fs = require("fs");
+const Stripe = require("stripe");
 require("dotenv").config();
 
 /* [SERVER:IMPORTS_ENV] END */
@@ -152,9 +153,13 @@ const {
   VAPI_FORWARD_NUMBER,
   VAPI_DEFAULT_MODE,
   VAPI_WEBHOOK_SECRET,
+  
+  /* Stripe */
+  STRIPE_SECRET_KEY_CONSOLE,
 
 } = process.env;
 
+const stripe = STRIPE_SECRET_KEY_CONSOLE ? Stripe(STRIPE_SECRET_KEY_CONSOLE) : null;
 const DEFAULT_BOARD_ID = Number(MONDAY_BOARD_ID || 18290169368);
 const DEFAULT_GROUP_ID = String(MONDAY_GROUP_ID || "topics"); // 📥 Nouvelles demandes (Services v3)
 const MONDAY_LIMIT = Number(MONDAY_ITEMS_LIMIT || 50);
@@ -334,6 +339,7 @@ app.get("/api/health", (req, res) => {
       tidio: TIDIO_PROJECT_ID ? "ready" : "not_configured",
       youtube: YOUTUBE_API_KEY ? "ready" : "missing_key",
       zapier: ZAPIER_SMS_WEBHOOK_URL ? "ready" : "missing_webhook",
+      stripe: STRIPE_SECRET_KEY_CONSOLE ? "ready" : "missing_key",
       gpt: OPENAI_API_KEY ? "ready" : "disabled",
       transcript: "poc_safe",
       mondayMap:
