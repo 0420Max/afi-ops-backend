@@ -1179,34 +1179,22 @@ app.post("/api/tickets/quick-create", async (req, res) => {
       return res.status(400).json({ ok: false, error: "boardId and name required" });
     }
 
-    // Build column_values JSON for Monday API
     const colVals = {};
 
     for (const [key, val] of Object.entries(columnValues || {})) {
       if (val === undefined || val === null || val === "") continue;
 
-      // Status columns expect { label: "..." }
       if (typeof val === "object" && val.label) {
         colVals[key] = val;
-      }
-      // Date columns expect { date: "YYYY-MM-DD" }
-      else if (typeof val === "object" && val.date) {
+      } else if (typeof val === "object" && val.date) {
         colVals[key] = val;
-      }
-      // Email column
-      else if (key === "email_mkx53410") {
+      } else if (key === "email_mkx53410") {
         colVals[key] = { email: val, text: val };
-      }
-      // Phone column
-      else if (key === "phone_mkx5xy3x") {
+      } else if (key === "phone_mkx5xy3x") {
         colVals[key] = { phone: val, countryShortName: "CA" };
-      }
-      // Long text columns
-      else if (key.startsWith("long_text_")) {
+      } else if (key.startsWith("long_text_")) {
         colVals[key] = { text: val };
-      }
-      // Text columns
-      else {
+      } else {
         colVals[key] = val;
       }
     }
@@ -1218,48 +1206,25 @@ app.post("/api/tickets/quick-create", async (req, res) => {
       }
     }`;
 
-    const variables = {
+    const r = await mondayRequest(mutation, {
       boardId: String(boardId),
       groupId: groupId || "topics",
       name: name,
       cols: JSON.stringify(colVals),
-    };
+    });
 
-    const response = await axios.post(
-      "https://api.monday.com/v2",
-      { query: mutation, variables },
-      {
-        headers: {
-          Authorization: process.env.MONDAY_TOKEN,
-          "Content-Type": "application/json",
-        },
-      }
-    );
-
-    const created = response.data?.data?.create_item;
+    const created = r.data?.data?.create_item;
 
     if (created?.id) {
       console.log(`[QUICK-TICKET] Created: ${created.name} (#${created.id})`);
-      res.json({
-        ok: true,
-        itemId: created.id,
-        itemName: created.name,
-      });
+      res.json({ ok: true, itemId: created.id, itemName: created.name });
     } else {
-      console.error("[QUICK-TICKET] Monday API error:", response.data);
-      res.status(500).json({
-        ok: false,
-        error: "Monday API did not return item",
-        details: response.data?.errors || response.data,
-      });
+      console.error("[QUICK-TICKET] Monday error:", r.data);
+      res.status(500).json({ ok: false, error: "Monday API error", details: r.data?.errors || r.data });
     }
   } catch (err) {
-    console.error("[QUICK-TICKET] Error:", err?.response?.data || err.message);
-    res.status(500).json({
-      ok: false,
-      error: err.message,
-      details: err?.response?.data,
-    });
+    console.error("[QUICK-TICKET] Error:", err?.message);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
