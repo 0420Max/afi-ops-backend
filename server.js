@@ -1227,6 +1227,287 @@ app.post("/api/tickets/quick-create", async (req, res) => {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
+/* ============================================================
+   [SERVER:ROUTES_POOL360] START
+   Pool360 CIT API — Proxy routes for AFI OPS Console
+============================================================ */
+const POOL360_API_KEY = process.env.POOL360_API_KEY || "";
+const POOL360_BASE = (process.env.POOL360_BASE_URL || "https://cit.pool360.com/sandbox").replace(/\/$/, "");
+const POOL360_BRANCH = process.env.POOL360_BRANCH || "278";
+
+function pool360Headers() {
+  return {
+    "Ocp-Apim-Subscription-Key": POOL360_API_KEY,
+    "Content-Type": "application/json",
+  };
+}
+
+// --- Health check ---
+app.get("/api/pool360/status", (req, res) => {
+  res.json({
+    ok: true,
+    configured: !!POOL360_API_KEY,
+    baseUrl: POOL360_BASE,
+    branch: POOL360_BRANCH,
+  });
+});
+
+// --- Product Search (by MPN, UPC, or Vendor) ---
+app.get("/api/pool360/search", async (req, res) => {
+  try {
+    if (!POOL360_API_KEY) {
+      return res.status(503).json({ ok: false, error: "POOL360_API_KEY not configured" });
+    }
+
+    const { mpn, upc, vendor } = req.query;
+    if (!mpn && !upc && !vendor) {
+      return res.status(400).json({ ok: false, error: "At least one of mpn, upc, or vendor is required" });
+    }
+
+    const params = new URLSearchParams();
+    if (mpn) params.set("MPN", mpn);
+    if (upc) params.set("UPC", upc);
+    if (vendor) params.set("Vendor", vendor);
+
+    const url = `${POOL360_BASE}/Products?${params.toString()}`;
+    console.log(`[POOL360] Search: ${url}`);
+
+    const r = await axios.get(url, { headers: pool360Headers(), timeout: 15000 });
+
+    res.json({ ok: true, count: (r.data || []).length, products: r.data || [] });
+  } catch (err) {
+    const status = err?.response?.status || 500;
+    const details = err?.response?.data || { error: err?.message };
+    console.error("[POOL360] Search error:", status, details);
+    res.status(status).json({ ok: false, error: "POOL360_ERROR", details });
+  }
+});
+
+// --- Pricing (by product number) ---
+app.get("/api/pool360/price/:products", async (req, res) => {
+  try {
+    if (!POOL360_API_KEY) {
+      return res.status(503).json({ ok: false, error: "POOL360_API_KEY not configured" });
+    }
+
+    const { products } = req.params;
+    const url = `${POOL360_BASE}/pricing/products/${encodeURIComponent(products)}`;
+    console.log(`[POOL360] Price: ${url}`);
+
+    const r = await axios.get(url, { headers: pool360Headers(), timeout: 15000 });
+
+    res.json({ ok: true, pricing: r.data || [] });
+  } catch (err) {
+    const status = err?.response?.status || 500;
+    const details = err?.response?.data || { error: err?.message };
+    console.error("[POOL360] Price error:", status, details);
+    res.status(status).json({ ok: false, error: "POOL360_ERROR", details });
+  }
+});
+
+// --- Pricing search (by MPN or UPC) ---
+app.get("/api/pool360/price-search", async (req, res) => {
+  try {
+    if (!POOL360_API_KEY) {
+      return res.status(503).json({ ok: false, error: "POOL360_API_KEY not configured" });
+    }
+
+    const { mpn, upc, vendor } = req.query;
+    if (!mpn && !upc) {
+      return res.status(400).json({ ok: false, error: "mpn or upc required" });
+    }
+
+    const params = new URLSearchParams();
+    if (mpn) params.set("MPN", mpn);
+    if (upc) params.set("UPC", upc);
+    if (vendor) params.set("Vendor", vendor);
+
+    const url = `${POOL360_BASE}/pricing/products/search?${params.toString()}`;
+    console.log(`[POOL360] Price search: ${url}`);
+
+    const r = await axios.get(url, { headers: pool360Headers(), timeout: 15000 });
+
+    res.json({ ok: true, pricing: r.data || [] });
+  } catch (err) {
+    const status = err?.response?.status || 500;
+    const details = err?.response?.data || { error: err?.message };
+    console.error("[POOL360] Price search error:", status, details);
+    res.status(status).json({ ok: false, error: "POOL360_ERROR", details });
+  }
+});
+
+// --- Product Availability (by product number + branch) ---
+app.get("/api/pool360/stock/:products", async (req, res) => {
+  try {
+    if (!POOL360_API_KEY) {
+      return res.status(503).json({ ok: false, error: "POOL360_API_KEY not configured" });
+    }
+
+    const { products } = req.params;
+    const branch = req.query.branch || POOL360_BRANCH;
+
+    const url = `${POOL360_BASE}/ProductAvailability/products/${encodeURIComponent(products)}/branches/${encodeURIComponent(branch)}`;
+    console.log(`[POOL360] Stock: ${url}`);
+
+    const r = await axios.get(url, { headers: pool360Headers(), timeout: 15000 });
+
+    res.json({ ok: true, availability: r.data || [] });
+  } catch (err) {
+    const status = err?.response?.status || 500;
+    const details = err?.response?.data || { error: err?.message };
+    console.error("[POOL360] Stock error:", status, details);
+    res.status(status).json({ ok: false, error: "POOL360_ERROR", details });
+  }
+});
+
+// --- Availability search (by MPN or UPC) ---
+app.get("/api/pool360/stock-search", async (req, res) => {
+  try {
+    if (!POOL360_API_KEY) {
+      return res.status(503).json({ ok: false, error: "POOL360_API_KEY not configured" });
+    }
+
+    const { mpn, upc } = req.query;
+    const branch = req.query.branch || POOL360_BRANCH;
+
+    if (!mpn && !upc) {
+      return res.status(400).json({ ok: false, error: "mpn or upc required" });
+    }
+
+    const params = new URLSearchParams();
+    if (mpn) params.set("MPN", mpn);
+    if (upc) params.set("UPC", upc);
+    params.set("Branches", branch);
+
+    const url = `${POOL360_BASE}/ProductAvailability/search?${params.toString()}`;
+    console.log(`[POOL360] Stock search: ${url}`);
+
+    const r = await axios.get(url, { headers: pool360Headers(), timeout: 15000 });
+
+    res.json({ ok: true, availability: r.data || [] });
+  } catch (err) {
+    const status = err?.response?.status || 500;
+    const details = err?.response?.data || { error: err?.message };
+    console.error("[POOL360] Stock search error:", status, details);
+    res.status(status).json({ ok: false, error: "POOL360_ERROR", details });
+  }
+});
+
+// --- Create Order ---
+app.post("/api/pool360/orders", async (req, res) => {
+  try {
+    if (!POOL360_API_KEY) {
+      return res.status(503).json({ ok: false, error: "POOL360_API_KEY not configured" });
+    }
+
+    const url = `${POOL360_BASE}/orders`;
+    console.log(`[POOL360] Create order`);
+
+    const r = await axios.post(url, req.body, { headers: pool360Headers(), timeout: 30000 });
+
+    res.json({ ok: true, order: r.data });
+  } catch (err) {
+    const status = err?.response?.status || 500;
+    const details = err?.response?.data || { error: err?.message };
+    console.error("[POOL360] Order error:", status, details);
+    res.status(status).json({ ok: false, error: "POOL360_ORDER_ERROR", details });
+  }
+});
+
+// --- Invoices ---
+app.get("/api/pool360/invoices", async (req, res) => {
+  try {
+    if (!POOL360_API_KEY) {
+      return res.status(503).json({ ok: false, error: "POOL360_API_KEY not configured" });
+    }
+
+    const startDate = req.query.startDate || new Date(Date.now() - 90 * 86400000).toISOString().split("T")[0];
+    const endDate = req.query.endDate || new Date().toISOString().split("T")[0];
+    const orderStatus = req.query.status || "ALL";
+
+    const url = `${POOL360_BASE}/Invoices/StartDate/${startDate}/EndDate/${endDate}/OrderStatus/${orderStatus}`;
+    console.log(`[POOL360] Invoices: ${url}`);
+
+    const r = await axios.get(url, { headers: pool360Headers(), timeout: 15000 });
+
+    res.json({ ok: true, count: (r.data || []).length, invoices: r.data || [] });
+  } catch (err) {
+    const status = err?.response?.status || 500;
+    const details = err?.response?.data || { error: err?.message };
+    console.error("[POOL360] Invoice error:", status, details);
+    res.status(status).json({ ok: false, error: "POOL360_ERROR", details });
+  }
+});
+
+// --- Unified Lookup (search + price + stock in one call) ---
+app.get("/api/pool360/lookup", async (req, res) => {
+  try {
+    if (!POOL360_API_KEY) {
+      return res.status(503).json({ ok: false, error: "POOL360_API_KEY not configured" });
+    }
+
+    const { mpn, upc, vendor, productNumber } = req.query;
+    const branch = req.query.branch || POOL360_BRANCH;
+
+    let products = [];
+    let pricing = [];
+    let availability = [];
+
+    // If productNumber is provided, use direct endpoints
+    if (productNumber) {
+      const [priceRes, stockRes] = await Promise.allSettled([
+        axios.get(`${POOL360_BASE}/pricing/products/${encodeURIComponent(productNumber)}`, {
+          headers: pool360Headers(), timeout: 15000,
+        }),
+        axios.get(`${POOL360_BASE}/ProductAvailability/products/${encodeURIComponent(productNumber)}/branches/${encodeURIComponent(branch)}`, {
+          headers: pool360Headers(), timeout: 15000,
+        }),
+      ]);
+
+      pricing = priceRes.status === "fulfilled" ? priceRes.value.data || [] : [];
+      availability = stockRes.status === "fulfilled" ? stockRes.value.data || [] : [];
+    }
+    // Otherwise search by MPN/UPC
+    else if (mpn || upc) {
+      const searchParams = new URLSearchParams();
+      if (mpn) searchParams.set("MPN", mpn);
+      if (upc) searchParams.set("UPC", upc);
+      if (vendor) searchParams.set("Vendor", vendor);
+
+      const [searchRes, priceRes, stockRes] = await Promise.allSettled([
+        axios.get(`${POOL360_BASE}/Products?${searchParams.toString()}`, {
+          headers: pool360Headers(), timeout: 15000,
+        }),
+        axios.get(`${POOL360_BASE}/pricing/products/search?${searchParams.toString()}`, {
+          headers: pool360Headers(), timeout: 15000,
+        }),
+        axios.get(`${POOL360_BASE}/ProductAvailability/search?${searchParams.toString()}&Branches=${branch}`, {
+          headers: pool360Headers(), timeout: 15000,
+        }),
+      ]);
+
+      products = searchRes.status === "fulfilled" ? searchRes.value.data || [] : [];
+      pricing = priceRes.status === "fulfilled" ? priceRes.value.data || [] : [];
+      availability = stockRes.status === "fulfilled" ? stockRes.value.data || [] : [];
+    } else {
+      return res.status(400).json({ ok: false, error: "Provide productNumber, mpn, or upc" });
+    }
+
+    res.json({
+      ok: true,
+      branch,
+      products,
+      pricing,
+      availability,
+    });
+  } catch (err) {
+    console.error("[POOL360] Lookup error:", err?.message);
+    res.status(500).json({ ok: false, error: err?.message });
+  }
+});
+
+console.log("[POOL360] Routes registered:", POOL360_API_KEY ? "✅ API key present" : "⚠️ No API key");
+/* [SERVER:ROUTES_POOL360] END */
 
 /* ============================================================
 5.0) ✅ PATCH (non-breaking): /api/monday/tickets-normalized
